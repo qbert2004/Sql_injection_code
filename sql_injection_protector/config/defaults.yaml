@@ -1,0 +1,77 @@
+# SQL Injection Protector - Default Configuration
+sql_injection_protector:
+  # Detection layer settings
+  detection:
+    signature_weight: 0.3
+    ml_weight: 0.5
+    heuristic_weight: 0.2
+    model_type: transformer  # transformer | tfidf | ensemble
+    model_path: models/v1/transformer
+    fallback_to_tfidf: true
+    tfidf_model_path: models/v1/tfidf_fallback.pkl
+    max_input_length: 10000
+    batch_size: 32
+
+  # Decision engine thresholds
+  decision:
+    block_threshold: 0.8
+    challenge_threshold: 0.6
+    alert_threshold: 0.4
+    sanitize_threshold: 0.3
+    strict_mode: false
+    learning_mode: false
+
+  # Rate limiting (Redis-based)
+  rate_limiting:
+    enabled: true
+    redis_url: redis://localhost:6379/0
+    requests_per_minute: 100
+    requests_per_hour: 1000
+    ban_duration_seconds: 3600
+    sliding_window: true
+
+  # Honeypot configuration
+  honeypot:
+    enabled: true
+    endpoints:
+      - /admin
+      - /wp-admin
+      - /.env
+      - /phpmyadmin
+      - /config.php
+      - /.git/config
+    collect_payloads: true
+    fake_responses: true
+
+  # Learning and feedback loop
+  learning:
+    collect_payloads: true
+    auto_retrain: true
+    min_samples_for_retrain: 500
+    retrain_interval_hours: 24
+    canary_deploy_percentage: 0.1
+    manual_review_threshold: 0.5
+
+  # Observability and SIEM
+  observability:
+    cef_enabled: true
+    syslog_host: null  # Set to your SIEM host
+    syslog_port: 514
+    syslog_protocol: udp  # udp | tcp
+    prometheus_enabled: true
+    prometheus_port: 9090
+    log_level: INFO
+    audit_log_path: null  # Set for file-based audit logging
+
+  # Preprocessing settings
+  preprocessing:
+    max_decode_iterations: 5
+    normalize_unicode: true
+    decode_html_entities: true
+    remove_null_bytes: true
+    lowercase: true
+
+  # Application settings
+  app_name: SQLInjectionProtector
+  environment: production
+  debug: false
