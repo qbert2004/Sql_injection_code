@@ -1,12 +1,50 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
 .venv/
 venv/
+ENV/
+
+# IDEs
 .idea/
 .vscode/
-*.log
-*.pkl
+*.swp
+*.swo
+
+# Environment variables
 .env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+incidents.db
+
+# Test coverage
 .coverage
 htmlcov/
-*.db
+.pytest_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Large datasets (keep only essential)
+*.csv
+!SQL_Dataset_Extended.csv
