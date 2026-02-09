@@ -85,11 +85,12 @@ class SQLSemanticAnalyzer:
     ]
 
     # SQL functions (time-based, file access, etc.)
+    # Note: Must include () or be word-bounded to avoid false positives
     SQL_FUNCTIONS = [
-        'sleep', 'benchmark', 'waitfor', 'delay', 'pg_sleep',
-        'load_file', 'into outfile', 'into dumpfile',
-        'concat', 'char', 'ascii', 'substring', 'substr', 'mid',
-        'version', 'database', 'user', 'current_user', 'schema'
+        'sleep(', 'benchmark(', 'waitfor', 'delay', 'pg_sleep(',
+        'load_file(', 'into outfile', 'into dumpfile',
+        'concat(', 'char(', 'ascii(', 'substring(', 'substr(', 'mid(',
+        'version(', 'database(', 'user(', 'current_user(', 'schema('
     ]
 
     # SQL comment patterns
@@ -109,6 +110,9 @@ class SQLSemanticAnalyzer:
         text_lower = text.lower()
         text_clean = urllib.parse.unquote(text_lower)
 
+        # Remove inline comments to catch obfuscation like UN/**/ION
+        text_normalized = re.sub(r'/\*.*?\*/', '', text_clean)
+
         score = 0.0
         breakdown = {
             'high_risk_keywords': [],
@@ -119,24 +123,35 @@ class SQLSemanticAnalyzer:
         }
 
         # === HIGH-RISK SQL KEYWORDS (+3 each) ===
+        # Use text_normalized to catch obfuscation like UN/**/ION
         for kw in cls.HIGH_RISK_KEYWORDS:
-            if re.search(rf'\b{kw}\b', text_clean, re.I):
+            if re.search(rf'\b{kw}\b', text_normalized, re.I):
                 score += 3
                 breakdown['high_risk_keywords'].append(kw)
 
         # === MEDIUM-RISK KEYWORDS (+1 each, max +3) ===
         medium_count = 0
         for kw in cls.MEDIUM_RISK_KEYWORDS:
-            if re.search(rf'\b{kw}\b', text_clean, re.I):
+            if re.search(rf'\b{kw}\b', text_normalized, re.I):
                 medium_count += 1
                 breakdown['medium_risk_keywords'].append(kw)
         score += min(medium_count, 3)
 
         # === SQL FUNCTIONS (+4 each) ===
         for fn in cls.SQL_FUNCTIONS:
-            if fn in text_clean:
+            if fn in text_normalized:
                 score += 4
                 breakdown['sql_functions'].append(fn)
+
+        # === ALTERNATIVE LOGIC OPERATORS (+3) ===
+        # || is string concat in Oracle/PostgreSQL, can be used for injection
+        if re.search(r"'\s*\|\|\s*'", text_clean):
+            score += 3
+            breakdown['injection_patterns'].append("concat-operator")
+        # && is AND alternative
+        if re.search(r"'\s*&&\s*'", text_clean):
+            score += 3
+            breakdown['injection_patterns'].append("and-operator")
 
         # === COMMENT PATTERNS (+2 each) ===
         # Note: Only count if pattern appears in SQL-like context
@@ -177,10 +192,14 @@ class SQLSemanticAnalyzer:
             score += 3
             breakdown['injection_patterns'].append("tautology-string")
 
-        # Pattern: UNION SELECT
+        # Pattern: UNION SELECT (normal and obfuscated)
         if re.search(r'\bunion\b.*\bselect\b', text_clean, re.I):
             score += 4
             breakdown['injection_patterns'].append("union-select")
+        # Obfuscated: UN/**/ION/**/SE/**/LECT -> unionselect (no boundaries)
+        elif re.search(r'union\s*select', text_normalized, re.I):
+            score += 4
+            breakdown['injection_patterns'].append("union-select-obfuscated")
 
         # Pattern: quote followed by SQL keyword (must be start of injection)
         # More restrictive: requires the keyword to be meaningful (OR/AND with space after)
@@ -191,6 +210,12 @@ class SQLSemanticAnalyzer:
         if re.search(r"'\s*(or|and)\s+\d", text_clean, re.I):
             score += 2
             breakdown['injection_patterns'].append("quote-keyword")
+
+        # Pattern: No-space obfuscation 'OR'1'='1 or 'AND'1'='1
+        # Catches: 'OR'x'='x, 'AND'1'='1 without spaces
+        if re.search(r"'(or|and)'[^']*'='", text_clean, re.I):
+            score += 4
+            breakdown['injection_patterns'].append("no-space-obfuscation")
 
         return {
             'score': score,
@@ -394,6 +419,17 @@ class SQLInjectionEnsemble:
                 'confidence_level': 'HIGH',
                 'score': S,
                 'reason': f'RF strong signal: P_rf={P_rf:.2f}, sem_score={sem_score:.1f}',
+                'action': Action.BLOCK
+            }
+
+        # === RULE 3.5: Very high semantic score (advanced injection patterns) ===
+        # Catches sophisticated attacks that may fool ML but have clear SQL semantics
+        if sem_score >= 6:
+            return {
+                'decision': Decision.INJECTION,
+                'confidence_level': 'MEDIUM',
+                'score': S,
+                'reason': f'High semantic score {sem_score:.1f} indicates SQL injection patterns',
                 'action': Action.BLOCK
             }
 
