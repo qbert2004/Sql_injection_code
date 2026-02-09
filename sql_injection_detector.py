@@ -1,475 +1,613 @@
 """
-SQL Injection Prevention Agent - Core Detection Module
-Многоуровневая система детектирования SQL-инъекций
+SQL Injection Detector - Production Module with Ensemble + INVALID Detection
+=============================================================================
+Combines Random Forest (classic ML) and CNN (deep learning) for robust detection.
+Includes semantic analysis to distinguish SQL injections from malformed input.
+
+Usage:
+    from sql_injection_detector import SQLInjectionEnsemble
+
+    detector = SQLInjectionEnsemble()
+    result = detector.detect("' OR '1'='1")
+
+    print(f"Decision: {result['decision']}")
+    print(f"Action: {result['action']}")
+    print(f"Confidence: {result['confidence_level']}")
 """
 
 import re
-import json
-import logging
-from typing import Dict, List, Tuple, Optional, Any
-from datetime import datetime, timezone
-from dataclasses import dataclass, asdict
-import pickle
+import urllib.parse
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from urllib.parse import unquote_plus
+import joblib
+import pickle
+from pathlib import Path
+from typing import Dict, Any, Optional, List
+from dataclasses import dataclass
+from enum import Enum
 
-# ============================================================================
-# КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
-# ============================================================================
+MODULE_DIR = Path(__file__).parent
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("SQLInjectionAgent")
+
+class Decision(Enum):
+    SAFE = "SAFE"
+    INVALID = "INVALID"          # Malformed input (no SQL semantics)
+    SUSPICIOUS = "SUSPICIOUS"
+    INJECTION = "INJECTION"
+
+
+class Action(Enum):
+    ALLOW = "ALLOW"
+    LOG = "LOG"                  # Log for analysis but don't block
+    CHALLENGE = "CHALLENGE"      # CAPTCHA or additional verification
+    BLOCK = "BLOCK"
 
 
 @dataclass
-class DetectionResult:
-    """Результат детектирования"""
-    is_malicious: bool
-    confidence: float
-    detection_method: str
-    matched_patterns: List[str]
-    sanitized_value: Optional[str]
-    risk_score: float
-    timestamp: str
-    source: str = "unknown"
-
-    def to_siem_format(self) -> Dict:
-        """Формат для SIEM-систем (CEF, JSON)"""
-        return {
-            "timestamp": self.timestamp,
-            "event_type": "sql_injection_detection",
-            "severity": "critical" if self.is_malicious else "info",
-            "confidence": self.confidence,
-            "risk_score": self.risk_score,
-            "detection_method": self.detection_method,
-            "matched_patterns": self.matched_patterns,
-            "action": "blocked" if self.is_malicious else "allowed"
-        }
+class EnsembleConfig:
+    """Configuration for ensemble decision rule."""
+    alpha: float = 0.65          # CNN weight (higher = more trust in CNN)
+    beta: float = 0.35           # RF weight
+    tau_high: float = 0.60       # High confidence injection threshold
+    tau_low: float = 0.40        # Low confidence injection threshold
+    tau_safe: float = 0.30       # Safe threshold
+    tau_cnn_override: float = 0.75  # CNN single-model override
+    tau_rf_strong: float = 0.70     # RF strong signal threshold
+    # New: thresholds for INVALID detection
+    tau_semantic_min: float = 2.0   # Minimum semantic score to consider as SQLi
+    tau_model_divergence: float = 0.40  # |P_cnn - P_rf| threshold for divergence
 
 
-# ============================================================================
-# СЛОЙ ПОЛИТИКИ: СИГНАТУРЫ И ПАТТЕРНЫ
-# ============================================================================
+class SQLSemanticAnalyzer:
+    """
+    Rule-based pre-filter to calculate SQL semantic score.
 
-class SignaturePolicy:
-    """Сигнатурный детектор на основе регулярных выражений"""
+    Key insight: Real SQL injection has SQL SEMANTICS, not just special characters.
+    Malformed input has syntax patterns but NO SQL meaning.
 
-    # Критические SQL-паттерны
-    CRITICAL_PATTERNS = {
-        'union_select': r'union\s+(all\s+)?select',
-        'sql_comment': r'(--|#|/\*|\*/)',
-        'always_true': r'(\d+\s*=\s*\d+|[\'"]?\w+[\'"]?\s*=\s*[\'"]?\w+[\'"]?)',
-        'drop_table': r'drop\s+(table|database|schema)',
-        'exec_command': r'(exec|execute|xp_cmdshell)\s*\(',
-        'information_schema': r'information_schema\.',
-        'sleep_delay': r'(sleep|waitfor|benchmark|pg_sleep)\s*\(',
-        'stacked_queries': r';\s*(select|insert|update|delete|drop)',
-        'hex_encoding': r'0x[0-9a-f]+',
-        'char_function': r'char\s*\(\s*\d+',
-        'into_outfile': r'into\s+(outfile|dumpfile)',
-        'load_file': r'load_file\s*\(',
-        'sql_keywords': r'\b(select|insert|update|delete|drop|create|alter|truncate)\b',
-        'quote_escape': r'(\\\'|\\"|%27|%22)',
-        'or_injection': r'\bor\b\s+[\'"]*\d+[\'"]*\s*=\s*[\'"]*\d+[\'"]*',
-        'blind_sqli': r'(substring|substr|mid|ascii|ord)\s*\(',
-        'database_enum': r'(database|schema|table_name|column_name)\s*\(',
-    }
+    Score components:
+        - SQL keywords (SELECT, UNION, OR, AND, DROP, etc.)
+        - SQL functions (SLEEP, BENCHMARK, LOAD_FILE)
+        - SQL operators and patterns
+        - Comment patterns (--, /*, #)
+        - Quote-escape patterns
+    """
 
-    # Whitelist: безопасные паттерны
-    WHITELIST_PATTERNS = [
-        r'^[a-zA-Z0-9_\-\.@]+$',  # Простые идентификаторы
-        r'^\d{1,10}$',  # Числа
+    # High-risk SQL keywords (direct query manipulation)
+    HIGH_RISK_KEYWORDS = [
+        'select', 'union', 'insert', 'update', 'delete', 'drop',
+        'truncate', 'exec', 'execute', 'xp_', 'sp_'
     ]
 
-    # Blacklist: запрещенные символы
-    BLACKLIST_CHARS = [';', '--', '/*', '*/', 'xp_', 'sp_', '@@']
+    # Medium-risk keywords (logic manipulation)
+    MEDIUM_RISK_KEYWORDS = [
+        'or', 'and', 'where', 'from', 'having', 'group', 'order',
+        'like', 'between', 'in', 'is', 'null', 'not', 'exists'
+    ]
 
-    def __init__(self):
-        self.patterns = {
-            name: re.compile(pattern, re.IGNORECASE)
-            for name, pattern in self.CRITICAL_PATTERNS.items()
+    # SQL functions (time-based, file access, etc.)
+    SQL_FUNCTIONS = [
+        'sleep', 'benchmark', 'waitfor', 'delay', 'pg_sleep',
+        'load_file', 'into outfile', 'into dumpfile',
+        'concat', 'char', 'ascii', 'substring', 'substr', 'mid',
+        'version', 'database', 'user', 'current_user', 'schema'
+    ]
+
+    # SQL comment patterns
+    COMMENT_PATTERNS = ['--', '/*', '*/', '#']
+
+    @classmethod
+    def calculate_semantic_score(cls, text: str) -> Dict[str, Any]:
+        """
+        Calculate SQL semantic score for input text.
+
+        Returns:
+            Dict with:
+                - score: Total semantic score (0 = no SQL semantics)
+                - breakdown: Detailed scoring breakdown
+                - has_sql_semantics: Boolean flag
+        """
+        text_lower = text.lower()
+        text_clean = urllib.parse.unquote(text_lower)
+
+        score = 0.0
+        breakdown = {
+            'high_risk_keywords': [],
+            'medium_risk_keywords': [],
+            'sql_functions': [],
+            'comment_patterns': [],
+            'injection_patterns': []
         }
-        self.whitelist = [re.compile(p, re.IGNORECASE) for p in self.WHITELIST_PATTERNS]
 
-    def detect(self, value: str) -> Tuple[bool, List[str], float]:
-        """
-        Детектирование по сигнатурам
-        Returns: (is_malicious, matched_patterns, confidence)
-        """
-        decoded_value = self._decode_value(value)
-        matched = []
+        # === HIGH-RISK SQL KEYWORDS (+3 each) ===
+        for kw in cls.HIGH_RISK_KEYWORDS:
+            if re.search(rf'\b{kw}\b', text_clean, re.I):
+                score += 3
+                breakdown['high_risk_keywords'].append(kw)
 
-        # Проверка whitelist (строгая)
-        for pattern in self.whitelist:
-            if pattern.match(decoded_value):
-                return False, [], 0.0
+        # === MEDIUM-RISK KEYWORDS (+1 each, max +3) ===
+        medium_count = 0
+        for kw in cls.MEDIUM_RISK_KEYWORDS:
+            if re.search(rf'\b{kw}\b', text_clean, re.I):
+                medium_count += 1
+                breakdown['medium_risk_keywords'].append(kw)
+        score += min(medium_count, 3)
 
-        # Проверка blacklist символов
-        for char in self.BLACKLIST_CHARS:
-            if char in decoded_value.lower():
-                matched.append(f"blacklist_char:{char}")
+        # === SQL FUNCTIONS (+4 each) ===
+        for fn in cls.SQL_FUNCTIONS:
+            if fn in text_clean:
+                score += 4
+                breakdown['sql_functions'].append(fn)
 
-        # Проверка критических паттернов
-        for name, pattern in self.patterns.items():
-            if pattern.search(decoded_value):
-                matched.append(name)
+        # === COMMENT PATTERNS (+2 each) ===
+        # Note: Only count if pattern appears in SQL-like context
+        if '--' in text_clean:
+            score += 2
+            breakdown['comment_patterns'].append('--')
+        if '/*' in text_clean or '*/' in text_clean:
+            score += 2
+            breakdown['comment_patterns'].append('/*...*/')
+        # MySQL # comment only if after quote or alphanumeric (not standalone)
+        if re.search(r"['\w]\s*#", text_clean):
+            score += 2
+            breakdown['comment_patterns'].append('#')
 
-        if matched:
-            confidence = min(1.0, len(matched) * 0.2 + 0.3)
-            return True, matched, confidence
+        # === INJECTION-SPECIFIC PATTERNS ===
+        # NOTE: Patterns must be CONTEXTUAL to avoid false positives on garbage input
 
-        return False, [], 0.0
+        # Pattern: ' OR '1'='1 / ' AND '1'='1 (classic injection with logic)
+        # Requires: quote + logic operator + quote pattern
+        if re.search(r"'\s*(or|and)\s+['\d]", text_clean, re.I):
+            score += 3
+            breakdown['injection_patterns'].append("quote-logic-quote")
 
-    def _decode_value(self, value: str) -> str:
-        """Декодирование URL и специальных символов"""
-        decoded = unquote_plus(value)
-        decoded = decoded.replace('%20', ' ')
-        return decoded
+        # Pattern: '=' only in SQL context (after OR/AND or before --)
+        # More restrictive: requires SQL keyword nearby
+        if re.search(r"(or|and)\s+'\w*'\s*=\s*'\w*'", text_clean, re.I):
+            score += 2
+            breakdown['injection_patterns'].append("quote-equals-quote")
 
+        # Pattern: Standalone tautology 1=1, 2=2 (must be word-bounded, not inside garbage)
+        # Only match if: start of string, after space/operator, or after SQL keyword
+        if re.search(r"(^|or|and|where|\s)(\d)\s*=\s*\2(\s|$|;|--)", text_clean, re.I):
+            score += 3
+            breakdown['injection_patterns'].append("tautology-numeric")
 
-# ============================================================================
-# ML-ДЕТЕКТОР: TF-IDF + ЛОГИСТИЧЕСКАЯ РЕГРЕССИЯ
-# ============================================================================
+        # Pattern: 'x'='x' tautology - must have SQL context (OR/AND nearby)
+        if re.search(r"(or|and)\s+'(\w+)'\s*=\s*'\2'", text_clean, re.I):
+            score += 3
+            breakdown['injection_patterns'].append("tautology-string")
 
-class MLDetector:
-    """Machine Learning детектор на основе TF-IDF + LogReg"""
+        # Pattern: UNION SELECT
+        if re.search(r'\bunion\b.*\bselect\b', text_clean, re.I):
+            score += 4
+            breakdown['injection_patterns'].append("union-select")
 
-    def __init__(self):
-        self.vectorizer = TfidfVectorizer(
-            analyzer='char',
-            ngram_range=(2, 5),
-            max_features=1000,
-            lowercase=True
-        )
-        self.model = LogisticRegression(
-            C=1.0,
-            max_iter=1000,
-            random_state=42
-        )
-        self.is_trained = False
+        # Pattern: quote followed by SQL keyword (must be start of injection)
+        # More restrictive: requires the keyword to be meaningful (OR/AND with space after)
+        if re.search(r"'\s*;\s*(select|insert|update|delete|drop)", text_clean, re.I):
+            score += 3
+            breakdown['injection_patterns'].append("stacked-query")
 
-    def train(self, training_data: List[str], labels: List[int]):
-        """
-        Обучение модели
-        training_data: список строк (SQL-запросы/параметры)
-        labels: 1 - вредоносный, 0 - безопасный
-        """
-        X = self.vectorizer.fit_transform(training_data)
-        self.model.fit(X, labels)
-        self.is_trained = True
-        logger.info(f"ML-модель обучена на {len(training_data)} примерах")
+        if re.search(r"'\s*(or|and)\s+\d", text_clean, re.I):
+            score += 2
+            breakdown['injection_patterns'].append("quote-keyword")
 
-    def predict(self, value: str) -> Tuple[bool, float]:
-        """
-        Предсказание
-        Returns: (is_malicious, probability)
-        """
-        if not self.is_trained:
-            return False, 0.0
-
-        X = self.vectorizer.transform([value])
-        proba = self.model.predict_proba(X)[0]
-
-        # proba[1] - вероятность класса "вредоносный"
-        is_malicious = proba[1] > 0.5
-        confidence = proba[1]
-
-        return is_malicious, confidence
-
-    def save_model(self, filepath: str):
-        """Сохранение модели"""
-        with open(filepath, 'wb') as f:
-            pickle.dump({'vectorizer': self.vectorizer, 'model': self.model}, f)
-        logger.info(f"Модель сохранена: {filepath}")
-
-    def load_model(self, filepath: str):
-        """Загрузка модели"""
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
-            self.vectorizer = data['vectorizer']
-            self.model = data['model']
-            self.is_trained = True
-        logger.info(f"Модель загружена: {filepath}")
+        return {
+            'score': score,
+            'breakdown': breakdown,
+            'has_sql_semantics': score >= 2
+        }
 
 
-# ============================================================================
-# ЭВРИСТИЧЕСКИЙ АНАЛИЗАТОР
-# ============================================================================
+class SQLInjectionEnsemble:
+    """
+    Ensemble SQL Injection Detector combining Random Forest and CNN.
 
-class HeuristicAnalyzer:
-    """Эвристический анализ запросов"""
+    Architecture:
+        - Random Forest: Good for clean SQL patterns, fast inference
+        - CNN: Better for obfuscated attacks, character-level patterns
+        - Semantic Analyzer: Rule-based pre-filter to detect SQL semantics
 
-    RISK_INDICATORS = {
-        'length': 100,  # Подозрительная длина
-        'special_chars_ratio': 0.3,  # Процент спецсимволов
-        'sql_keywords_count': 3,  # Количество SQL-ключевых слов
-        'encoded_chars': 5,  # Количество закодированных символов
-    }
+    Decision Rule (Updated with INVALID class):
+        1. Calculate SQL semantic score (rule-based)
+        2. Get model predictions (P_rf, P_cnn)
+        3. Apply decision logic:
 
-    def analyze(self, value: str) -> Tuple[float, Dict[str, Any]]:
-        """
-        Эвристический анализ
-        Returns: (risk_score, metrics)
-        """
-        metrics = {}
-        risk_score = 0.0
+        RULE 0: INVALID DETECTION
+            IF P_cnn >= 0.70 AND P_rf < 0.50 AND semantic_score < 2:
+                → INVALID (malformed input, not SQLi)
 
-        # Длина строки
-        length = len(value)
-        metrics['length'] = length
-        if length > self.RISK_INDICATORS['length']:
-            risk_score += 0.2
+        RULE 1: HIGH CONFIDENCE INJECTION
+            IF S >= 0.60 AND semantic_score >= 2:
+                → INJECTION
 
-        # Процент специальных символов
-        special_chars = sum(1 for c in value if not c.isalnum() and c not in ' \t\n')
-        special_ratio = special_chars / max(length, 1)
-        metrics['special_chars_ratio'] = special_ratio
-        if special_ratio > self.RISK_INDICATORS['special_chars_ratio']:
-            risk_score += 0.3
+        RULE 2: CNN OVERRIDE (obfuscation)
+            IF P_cnn >= 0.75 AND semantic_score >= 3:
+                → INJECTION
 
-        # SQL-ключевые слова
-        sql_keywords = ['select', 'insert', 'update', 'delete', 'union', 'drop', 'exec']
-        keyword_count = sum(1 for kw in sql_keywords if kw in value.lower())
-        metrics['sql_keywords_count'] = keyword_count
-        if keyword_count >= self.RISK_INDICATORS['sql_keywords_count']:
-            risk_score += 0.4
+        RULE 3: RF STRONG SIGNAL
+            IF P_rf >= 0.70 AND semantic_score >= 2:
+                → INJECTION
 
-        # Закодированные символы
-        encoded_count = value.count('%') + value.count('\\x')
-        metrics['encoded_chars'] = encoded_count
-        if encoded_count > self.RISK_INDICATORS['encoded_chars']:
-            risk_score += 0.1
+        RULE 4: SAFE
+            IF S < 0.30:
+                → SAFE
 
-        # Энтропия (разнообразие символов)
-        entropy = self._calculate_entropy(value)
-        metrics['entropy'] = entropy
-        if entropy > 4.5:
-            risk_score += 0.2
+        RULE 5: SUSPICIOUS
+            IF semantic_score >= 1:
+                → SUSPICIOUS
 
-        return min(risk_score, 1.0), metrics
+        RULE 6: DEFAULT INVALID
+            → INVALID (high model signal but no SQL semantics)
+    """
 
-    def _calculate_entropy(self, s: str) -> float:
-        """Расчет энтропии строки"""
-        if not s:
+    def __init__(self, config: Optional[EnsembleConfig] = None):
+        self.config = config or EnsembleConfig()
+        self.semantic_analyzer = SQLSemanticAnalyzer()
+
+        # Model paths
+        self.rf_model = None
+        self.rf_vectorizer = None
+        self.cnn_model = None
+        self.cnn_tokenizer = None
+
+        self.rf_loaded = False
+        self.cnn_loaded = False
+
+        self._load_models()
+
+    def _load_models(self):
+        """Load both RF and CNN models."""
+        # Load Random Forest
+        try:
+            self.rf_model = joblib.load(MODULE_DIR / 'rf_sql_model.pkl')
+            self.rf_vectorizer = joblib.load(MODULE_DIR / 'tfidf_vectorizer.pkl')
+            self.rf_loaded = True
+        except Exception as e:
+            print(f"Warning: RF model not loaded: {e}")
+
+        # Load CNN
+        try:
+            import tensorflow as tf
+            self.cnn_model = tf.keras.models.load_model(MODULE_DIR / 'models' / 'cnn_sql_detector.keras')
+            with open(MODULE_DIR / 'models' / 'dl_tokenizer.pkl', 'rb') as f:
+                self.cnn_tokenizer = pickle.load(f)
+            self.cnn_loaded = True
+        except Exception as e:
+            print(f"Warning: CNN model not loaded: {e}")
+
+    @staticmethod
+    def preprocess(text: str) -> str:
+        """Preprocess text for analysis."""
+        text = str(text).lower()
+        text = urllib.parse.unquote(text)
+        text = re.sub(r'/\*.*?\*/', ' ', text)
+        text = re.sub(r'--.*$', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+    @staticmethod
+    def extract_features(text: str) -> Dict[str, int]:
+        """Extract features for RF model."""
+        clean = SQLInjectionEnsemble.preprocess(text)
+        return {
+            'length': len(clean),
+            'num_digits': sum(c.isdigit() for c in clean),
+            'num_special': sum(not c.isalnum() and not c.isspace() for c in clean),
+            'num_quotes': clean.count("'") + clean.count('"'),
+            'num_keywords': len(re.findall(
+                r'\b(select|union|or|and|drop|sleep|where|from|insert|update|delete|having|group)\b',
+                clean
+            ))
+        }
+
+    def _predict_rf(self, text: str) -> float:
+        """Get RF probability."""
+        if not self.rf_loaded:
             return 0.0
 
-        freq = {}
-        for c in s:
-            freq[c] = freq.get(c, 0) + 1
+        from scipy.sparse import hstack
 
-        entropy = 0.0
-        length = len(s)
-        for count in freq.values():
-            p = count / length
-            entropy -= p * np.log2(p)
+        clean_text = self.preprocess(text)
+        features = self.extract_features(text)
 
-        return entropy
+        tfidf = self.rf_vectorizer.transform([clean_text])
+        extra = np.array([[
+            features['length'],
+            features['num_digits'],
+            features['num_special'],
+            features['num_quotes'],
+            features['num_keywords']
+        ]])
 
+        X = hstack([tfidf, extra])
+        return float(self.rf_model.predict_proba(X)[0][1])
 
-# ============================================================================
-# ГЛАВНЫЙ ДЕТЕКТОР: ОБЪЕДИНЕНИЕ ВСЕХ МЕТОДОВ
-# ============================================================================
+    def _predict_cnn(self, text: str) -> float:
+        """Get CNN probability."""
+        if not self.cnn_loaded:
+            return 0.0
 
-class SQLInjectionAgent:
-    """Главный агент детектирования SQL-инъекций"""
+        from tensorflow.keras.preprocessing.sequence import pad_sequences
 
-    def __init__(self, ml_model_path: Optional[str] = None):
-        self.signature_policy = SignaturePolicy()
-        self.ml_detector = MLDetector()
-        self.heuristic_analyzer = HeuristicAnalyzer()
+        clean_text = self.preprocess(text)
+        seq = self.cnn_tokenizer.texts_to_sequences([clean_text])
+        padded = pad_sequences(seq, maxlen=200, padding='post', truncating='post')
 
-        # Загрузка ML-модели, если есть
-        if ml_model_path:
-            try:
-                self.ml_detector.load_model(ml_model_path)
-            except FileNotFoundError:
-                logger.warning(f"ML-модель не найдена: {ml_model_path}")
+        return float(self.cnn_model.predict(padded, verbose=0)[0][0])
 
-        # Пороги детектирования
-        self.DETECTION_THRESHOLD = 0.5
-        self.RISK_THRESHOLD = 0.6
-
-    def analyze(self, value: str) -> DetectionResult:
+    def _ensemble_decision(self, P_rf: float, P_cnn: float, semantic: Dict) -> Dict[str, Any]:
         """
-        Комплексный анализ значения
+        Apply ensemble decision rule with INVALID detection.
+
+        Key innovation: Uses semantic score to distinguish:
+            - SQL Injection: High model scores + SQL semantics
+            - Malformed Input: High CNN score + Low RF + No SQL semantics
+
+        Returns dict with decision, confidence, reason, action.
         """
-        timestamp = datetime.now(timezone.utc).isoformat()
+        cfg = self.config
+        sem_score = semantic['score']
+        has_semantics = semantic['has_sql_semantics']
 
-        # 1. Сигнатурный анализ
-        sig_malicious, sig_patterns, sig_confidence = self.signature_policy.detect(value)
+        # Weighted ensemble score
+        S = cfg.alpha * P_cnn + cfg.beta * P_rf
 
-        # 2. ML-анализ
-        ml_malicious, ml_confidence = self.ml_detector.predict(value)
+        # Model divergence (CNN thinks SQLi, RF doesn't)
+        divergence = abs(P_cnn - P_rf)
 
-        # 3. Эвристический анализ
-        heur_risk, heur_metrics = self.heuristic_analyzer.analyze(value)
+        # === RULE 0: INVALID INPUT DETECTION ===
+        # High CNN + Low RF + No SQL semantics = Malformed/garbage input
+        if P_cnn >= 0.70 and P_rf < 0.50 and sem_score < cfg.tau_semantic_min:
+            return {
+                'decision': Decision.INVALID,
+                'confidence_level': 'HIGH',
+                'score': S,
+                'reason': f'Malformed input: P_cnn={P_cnn:.2f} but P_rf={P_rf:.2f}, sem_score={sem_score:.1f} (no SQL semantics)',
+                'action': Action.LOG
+            }
 
-        # Объединение результатов (взвешенное голосование)
-        weights = {
-            'signature': 0.5,
-            'ml': 0.3,
-            'heuristic': 0.2
+        # === RULE 1: High confidence injection (both models agree + semantics) ===
+        if S >= cfg.tau_high and has_semantics:
+            return {
+                'decision': Decision.INJECTION,
+                'confidence_level': 'HIGH',
+                'score': S,
+                'reason': f'Ensemble score {S:.2f} >= {cfg.tau_high}, sem_score={sem_score:.1f} (SQL semantics confirmed)',
+                'action': Action.BLOCK
+            }
+
+        # === RULE 2: CNN Override (obfuscation) - REQUIRES strong semantics ===
+        if P_cnn >= cfg.tau_cnn_override and sem_score >= 3:
+            return {
+                'decision': Decision.INJECTION,
+                'confidence_level': 'HIGH',
+                'score': S,
+                'reason': f'CNN override: P_cnn={P_cnn:.2f}, sem_score={sem_score:.1f} (obfuscated SQLi)',
+                'action': Action.BLOCK
+            }
+
+        # === RULE 3: RF Strong signal with semantics ===
+        if P_rf >= cfg.tau_rf_strong and has_semantics:
+            return {
+                'decision': Decision.INJECTION,
+                'confidence_level': 'HIGH',
+                'score': S,
+                'reason': f'RF strong signal: P_rf={P_rf:.2f}, sem_score={sem_score:.1f}',
+                'action': Action.BLOCK
+            }
+
+        # === RULE 4: Conflict zone with semantics ===
+        if S >= cfg.tau_low and has_semantics:
+            if P_cnn >= 0.50 or P_rf >= cfg.tau_rf_strong:
+                confidence = 'MEDIUM' if S < cfg.tau_high else 'HIGH'
+                return {
+                    'decision': Decision.INJECTION,
+                    'confidence_level': confidence,
+                    'score': S,
+                    'reason': f'Conflict zone with SQL semantics (P_rf={P_rf:.2f}, P_cnn={P_cnn:.2f}, sem={sem_score:.1f})',
+                    'action': Action.CHALLENGE if confidence == 'MEDIUM' else Action.BLOCK
+                }
+
+        # === RULE 5: High confidence safe ===
+        if S < cfg.tau_safe:
+            return {
+                'decision': Decision.SAFE,
+                'confidence_level': 'HIGH',
+                'score': S,
+                'reason': f'Ensemble score {S:.2f} < {cfg.tau_safe} (both models agree safe)',
+                'action': Action.ALLOW
+            }
+
+        # === RULE 6: Suspicious (has some SQL semantics but low confidence) ===
+        if sem_score >= 1:
+            return {
+                'decision': Decision.SUSPICIOUS,
+                'confidence_level': 'LOW',
+                'score': S,
+                'reason': f'Gray zone with weak SQL semantics: S={S:.2f}, sem={sem_score:.1f}',
+                'action': Action.CHALLENGE
+            }
+
+        # === RULE 7: Default to INVALID (model signal but no semantics) ===
+        return {
+            'decision': Decision.INVALID,
+            'confidence_level': 'MEDIUM',
+            'score': S,
+            'reason': f'No SQL semantics detected: S={S:.2f}, sem_score={sem_score:.1f}',
+            'action': Action.LOG
         }
 
-        combined_confidence = (
-            sig_confidence * weights['signature'] +
-            ml_confidence * weights['ml'] +
-            heur_risk * weights['heuristic']
-        )
+    def detect(self, text: str) -> Dict[str, Any]:
+        """
+        Detect SQL injection using ensemble of RF and CNN with semantic analysis.
 
-        is_malicious = (
-            sig_malicious or
-            (combined_confidence > self.DETECTION_THRESHOLD)
-        )
+        Args:
+            text: Input text to analyze
 
-        # Определение метода детектирования
-        if sig_malicious:
-            detection_method = "signature"
-        elif ml_malicious and ml_confidence > 0.7:
-            detection_method = "ml_model"
-        elif heur_risk > self.RISK_THRESHOLD:
-            detection_method = "heuristic"
-        else:
-            detection_method = "combined"
+        Returns:
+            Dict with:
+                - decision: SAFE, INVALID, SUSPICIOUS, or INJECTION
+                - action: ALLOW, LOG, CHALLENGE, or BLOCK
+                - confidence_level: HIGH, MEDIUM, or LOW
+                - score: Weighted ensemble score
+                - P_rf: Random Forest probability
+                - P_cnn: CNN probability
+                - semantic_score: SQL semantic score
+                - semantic_breakdown: Detailed semantic analysis
+                - reason: Human-readable explanation
+                - features: Extracted features
+        """
+        # Step 1: Semantic analysis (rule-based pre-filter)
+        semantic = self.semantic_analyzer.calculate_semantic_score(text)
 
-        # Риск-скор
-        risk_score = max(sig_confidence, ml_confidence, heur_risk)
+        # Step 2: Get individual model predictions
+        P_rf = self._predict_rf(text)
+        P_cnn = self._predict_cnn(text) if self.cnn_loaded else P_rf
 
-        # Санитизация (если нужна)
-        sanitized = self._sanitize_value(value) if not is_malicious else None
+        # Step 3: Apply ensemble decision rule
+        result = self._ensemble_decision(P_rf, P_cnn, semantic)
 
-        result = DetectionResult(
-            is_malicious=is_malicious,
-            confidence=combined_confidence,
-            detection_method=detection_method,
-            matched_patterns=sig_patterns,
-            sanitized_value=sanitized,
-            risk_score=risk_score,
-            timestamp=timestamp
-        )
+        # Add all analysis data
+        result['P_rf'] = P_rf
+        result['P_cnn'] = P_cnn
+        result['semantic_score'] = semantic['score']
+        result['semantic_breakdown'] = semantic['breakdown']
+        result['features'] = self.extract_features(text)
+        result['models_loaded'] = {
+            'rf': self.rf_loaded,
+            'cnn': self.cnn_loaded
+        }
 
-        # Логирование
-        self._log_detection(value, result)
+        # Convert enums to strings for JSON serialization
+        result['decision'] = result['decision'].value
+        result['action'] = result['action'].value
 
         return result
 
-    def _sanitize_value(self, value: str) -> str:
-        """Базовая санитизация значения"""
-        # Удаление опасных символов
-        sanitized = value.replace("'", "''")  # Экранирование одинарных кавычек
-        sanitized = re.sub(r'[;\-\-]', '', sanitized)  # Удаление ; и --
-        sanitized = re.sub(r'/\*.*?\*/', '', sanitized)  # Удаление комментариев
-        return sanitized
+    def detect_batch(self, texts: List[str]) -> List[Dict[str, Any]]:
+        """Detect SQL injection in multiple texts."""
+        return [self.detect(text) for text in texts]
 
-    def _log_detection(self, value: str, result: DetectionResult):
-        """Логирование результата детектирования"""
-        log_data = {
-            "value_preview": value[:50] + "..." if len(value) > 50 else value,
-            "result": asdict(result)
+    def is_safe(self, text: str) -> bool:
+        """Quick check if input is safe."""
+        decision = self.detect(text)['decision']
+        return decision in ['SAFE', 'INVALID']
+
+    def should_block(self, text: str) -> bool:
+        """Check if input should be blocked."""
+        return self.detect(text)['action'] == 'BLOCK'
+
+
+# === Legacy API for backward compatibility ===
+
+class SQLInjectionDetector:
+    """Legacy detector using only Random Forest (backward compatible)."""
+
+    def __init__(self, threshold: float = 0.5):
+        self._ensemble = SQLInjectionEnsemble()
+        self.threshold = threshold
+        self.model_loaded = self._ensemble.rf_loaded
+
+    def detect(self, text: str) -> Dict[str, Any]:
+        P_rf = self._ensemble._predict_rf(text)
+        is_injection = P_rf >= self.threshold
+
+        return {
+            'is_injection': is_injection,
+            'confidence': P_rf if is_injection else (1 - P_rf),
+            'label': 'SQL_INJECTION' if is_injection else 'SAFE',
+            'probability': P_rf,
+            'features': self._ensemble.extract_features(text)
         }
 
-        if result.is_malicious:
-            logger.warning(f"MALICIOUS REQUEST DETECTED: {json.dumps(log_data, indent=2)}")
-        else:
-            logger.info(f"Request analyzed: malicious={result.is_malicious}, confidence={result.confidence:.2f}")
+    def is_safe(self, text: str) -> bool:
+        return not self.detect(text)['is_injection']
 
 
-# ============================================================================
-# ОБУЧЕНИЕ МОДЕЛИ: ПРИМЕР ДАТАСЕТА
-# ============================================================================
+# === Convenience functions ===
 
-def train_initial_model(save_path: str = "sql_injection_model.pkl"):
-    """Обучение начальной ML-модели"""
-
-    # Примеры вредоносных запросов
-    malicious_samples = [
-        "' OR '1'='1",
-        "admin' --",
-        "1' UNION SELECT NULL, username, password FROM users--",
-        "'; DROP TABLE users; --",
-        "1' AND 1=0 UNION SELECT NULL, table_name FROM information_schema.tables--",
-        "1' AND SLEEP(5)--",
-        "1' OR '1'='1' /*",
-        "admin' OR 1=1#",
-        "' OR 'a'='a",
-        "1' UNION ALL SELECT NULL,NULL,NULL--",
-        "' UNION SELECT @@version--",
-        "1'; EXEC sp_MSForEachTable 'DROP TABLE ?'--",
-        "' OR EXISTS(SELECT * FROM users)--",
-        "1' AND ASCII(SUBSTRING((SELECT password FROM users LIMIT 1),1,1))>64--",
-        "'; WAITFOR DELAY '00:00:05'--",
-    ]
-
-    # Примеры безопасных запросов
-    safe_samples = [
-        "john.doe@example.com",
-        "Product123",
-        "Hello World",
-        "12345",
-        "user_name_123",
-        "Search query text",
-        "Category: Electronics",
-        "Price: 99.99",
-        "2023-01-15",
-        "New York",
-        "Order #45678",
-        "Customer feedback here",
-        "Product description with spaces",
-        "Valid email address",
-        "Normal text input",
-    ]
-
-    # Расширение датасета вариациями
-    extended_malicious = malicious_samples * 10  # Дублирование для баланса
-    extended_safe = safe_samples * 10
-
-    training_data = extended_malicious + extended_safe
-    labels = [1] * len(extended_malicious) + [0] * len(extended_safe)
-
-    # Обучение
-    detector = MLDetector()
-    detector.train(training_data, labels)
-    detector.save_model(save_path)
-
-    logger.info(f"Модель обучена и сохранена: {save_path}")
-    return detector
+def detect_sql_injection(text: str) -> Dict[str, Any]:
+    """Quick detection using ensemble (recommended)."""
+    detector = SQLInjectionEnsemble()
+    return detector.detect(text)
 
 
-# ============================================================================
-# ПРИМЕР ИСПОЛЬЗОВАНИЯ
-# ============================================================================
+def create_middleware():
+    """Create middleware function for web frameworks."""
+    detector = SQLInjectionEnsemble()
 
-if __name__ == "__main__":
-    # Обучение модели
-    print("=== Обучение ML-модели ===")
-    train_initial_model()
+    def check_request(params: Dict[str, str]) -> Dict[str, Any]:
+        """Check all parameters for SQL injection."""
+        blocked = False
+        results = []
 
-    # Инициализация агента
-    print("\n=== Инициализация агента ===")
-    agent = SQLInjectionAgent(ml_model_path="sql_injection_model.pkl")
+        for key, value in params.items():
+            if isinstance(value, str) and len(value) > 0:
+                result = detector.detect(value)
+                if result['action'] == 'BLOCK':
+                    blocked = True
+                results.append({
+                    'parameter': key,
+                    'decision': result['decision'],
+                    'action': result['action'],
+                    'score': result['score'],
+                    'semantic_score': result['semantic_score']
+                })
 
-    # Тестовые запросы
+        return {
+            'blocked': blocked,
+            'results': results
+        }
+
+    return check_request
+
+
+# === Demo ===
+
+if __name__ == '__main__':
+    print("="*90)
+    print("SQL Injection Ensemble Detector - Demo (with INVALID class)")
+    print("="*90)
+
+    detector = SQLInjectionEnsemble()
+    print(f"\nModels loaded: RF={detector.rf_loaded}, CNN={detector.cnn_loaded}")
+    print(f"Config: alpha={detector.config.alpha} (CNN), beta={detector.config.beta} (RF)")
+
     test_cases = [
-        "john.doe@example.com",  # Безопасный
-        "' OR '1'='1",  # Вредоносный
-        "Product name",  # Безопасный
-        "admin' --",  # Вредоносный
-        "1' UNION SELECT * FROM users--",  # Вредоносный
-        "Normal search query",  # Безопасный
+        # Real SQL Injections
+        "' OR '1'='1",
+        "SELECT * FROM users",
+        "admin'--",
+        "'; DROP TABLE users; --",
+        "' UNION SELECT password FROM users--",
+        "%27%20OR%20%271%27%3D%271",  # URL encoded
+
+        # Safe inputs
+        "John O'Brien",
+        "hello@email.com",
+        "McDonald's restaurant",
+
+        # INVALID / Malformed (should NOT be blocked)
+        "'fqule' = Robert O'nill",
+        "1 + 1 = 2",
+        "x' y' z' random garbage",
+        "!@#$%^&*()_+",
+        "'''''",
     ]
 
-    print("\n=== Тестирование детектирования ===")
-    for test_value in test_cases:
-        result = agent.analyze(test_value)
-        print(f"\nЗапрос: {test_value}")
-        print(f"Вредоносный: {result.is_malicious}")
-        print(f"Уверенность: {result.confidence:.2%}")
-        print(f"Метод: {result.detection_method}")
-        print(f"Риск-скор: {result.risk_score:.2%}")
-        if result.matched_patterns:
-            print(f"Паттерны: {result.matched_patterns}")
+    print(f"\n{'Input':<40} {'Decision':<12} {'Action':<10} {'Score':<6} {'P_rf':<6} {'P_cnn':<6} {'Sem':<5}")
+    print("-"*100)
+
+    for test in test_cases:
+        r = detector.detect(test)
+        display = test[:38] + '..' if len(test) > 40 else test
+        print(f"{display:<40} {r['decision']:<12} {r['action']:<10} {r['score']:.2f}   {r['P_rf']:.2f}   {r['P_cnn']:.2f}   {r['semantic_score']:.1f}")
+
+    print("\n" + "="*90)
+    print("Legend:")
+    print("  SAFE      - Legitimate input, allow")
+    print("  INVALID   - Malformed input (no SQL semantics), log but don't block")
+    print("  SUSPICIOUS- Unclear, requires human review or CAPTCHA")
+    print("  INJECTION - SQL injection detected, block immediately")
+    print("="*90)

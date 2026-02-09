@@ -6,7 +6,18 @@
       "Bash(python:*)",
       "Bash(sql_injection_detector.py)",
       "Bash(pip install:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(\".venv/Scripts/pip.exe\" install streamlit --quiet)",
+      "Bash(streamlit run:*)",
+      "Bash(curl:*)",
+      "Bash(ls:*)",
+      "Bash(wc:*)",
+      "Bash(ping:*)",
+      "Bash(.venvScriptsstreamlit.exe run streamlit_demo.py --server.port 8504)",
+      "Bash(C:/Users/unive/PycharmProjects/SQL_INJECTION_PROTECTOR_AI_AGENT/.venv/Scripts/streamlit.exe run:*)",
+      "Bash(cmd.exe /c \"cd /d C:\\\\Users\\\\unive\\\\PycharmProjects\\\\SQL_INJECTION_PROTECTOR_AI_AGENT && .venv\\\\Scripts\\\\activate && streamlit run streamlit_demo.py --server.port 8505\")",
+      "Bash(cmd.exe /c \"start cmd /k \"\"cd /d C:\\\\Users\\\\unive\\\\PycharmProjects\\\\SQL_INJECTION_PROTECTOR_AI_AGENT && .venv\\\\Scripts\\\\activate && streamlit run streamlit_demo.py --server.port 8505\"\"\")",
+      "Bash(start:*)"
     ],
     "deny": [],
     "ask": []
