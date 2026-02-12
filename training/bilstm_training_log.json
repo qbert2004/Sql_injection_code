@@ -1,0 +1,107 @@
+{
+  "config": {
+    "max_length": 200,
+    "embed_dim": 32,
+    "hidden_dim": 64,
+    "num_layers": 2,
+    "batch_size": 128,
+    "learning_rate": 0.0003,
+    "device": "cpu"
+  },
+  "epochs": [
+    {
+      "epoch": 1,
+      "train_loss": 0.1435,
+      "train_acc": 0.9385,
+      "val_loss": 0.0275,
+      "val_accuracy": 0.9927,
+      "val_precision": 0.9934,
+      "val_recall": 0.9905,
+      "val_f1": 0.992,
+      "val_roc_auc": 0.9983,
+      "val_fpr": 0.0055,
+      "lr": 0.0003,
+      "time_s": 309.9
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.0266,
+      "train_acc": 0.9936,
+      "val_loss": 0.0271,
+      "val_accuracy": 0.9933,
+      "val_precision": 0.998,
+      "val_recall": 0.9874,
+      "val_f1": 0.9927,
+      "val_roc_auc": 0.9981,
+      "val_fpr": 0.0017,
+      "lr": 0.0003,
+      "time_s": 243.4
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.0204,
+      "train_acc": 0.9955,
+      "val_loss": 0.0167,
+      "val_accuracy": 0.9965,
+      "val_precision": 0.9966,
+      "val_recall": 0.9957,
+      "val_f1": 0.9961,
+      "val_roc_auc": 0.9986,
+      "val_fpr": 0.0029,
+      "lr": 0.0003,
+      "time_s": 257.7
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.0176,
+      "train_acc": 0.9963,
+      "val_loss": 0.0145,
+      "val_accuracy": 0.9968,
+      "val_precision": 0.9972,
+      "val_recall": 0.9957,
+      "val_f1": 0.9965,
+      "val_roc_auc": 0.999,
+      "val_fpr": 0.0023,
+      "lr": 0.0003,
+      "time_s": 280.1
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.0159,
+      "train_acc": 0.9966,
+      "val_loss": 0.0142,
+      "val_accuracy": 0.9968,
+      "val_precision": 0.9967,
+      "val_recall": 0.9962,
+      "val_f1": 0.9965,
+      "val_roc_auc": 0.9991,
+      "val_fpr": 0.0028,
+      "lr": 0.0003,
+      "time_s": 239.4
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.0142,
+      "train_acc": 0.9969,
+      "val_loss": 0.0126,
+      "val_accuracy": 0.9972,
+      "val_precision": 0.9979,
+      "val_recall": 0.9959,
+      "val_f1": 0.9969,
+      "val_roc_auc": 0.9992,
+      "val_fpr": 0.0018,
+      "lr": 0.0003,
+      "time_s": 230.2
+    }
+  ],
+  "test_metrics": {
+    "accuracy": 0.997,
+    "precision": 0.9975,
+    "recall": 0.9959,
+    "f1": 0.9967,
+    "roc_auc": 0.9997,
+    "fpr": 0.0021,
+    "fnr": 0.0041,
+    "loss": 0.0111
+  }
+}

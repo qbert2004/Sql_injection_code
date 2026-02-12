@@ -20,7 +20,10 @@
       "Bash(start:*)",
       "Bash(\".venv/Scripts/python.exe\" global_test.py)",
       "Bash(\".venv/Scripts/python.exe\" -c \"\nfrom sql_injection_detector import SQLInjectionEnsemble, SQLSemanticAnalyzer\n\ndetector = SQLInjectionEnsemble\\(\\)\nanalyzer = SQLSemanticAnalyzer\\(\\)\n\ncases = [\n    ''C:/Users/Admin'',\n    \"\"x'' AND y'' OR z''\"\",\n    \"\"''OR''1''=''1\"\"\n]\n\nfor c in cases:\n    print\\(f''\\\\nQuery: {repr\\(c\\)}''\\)\n    sem = analyzer.calculate_semantic_score\\(c\\)\n    print\\(f''Semantic: {sem}''\\)\n    r = detector.detect\\(c\\)\n    print\\(f''Result: {r[\"\"decision\"\"]}/{r[\"\"action\"\"]} | S={r[\"\"score\"\"]:.2f} | P_rf={r[\"\"P_rf\"\"]:.2f} | P_cnn={r[\"\"P_cnn\"\"]:.2f}''\\)\n\")",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(set PYTHONUNBUFFERED=1)"
     ],
     "deny": [],
     "ask": []
