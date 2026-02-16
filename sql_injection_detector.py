@@ -512,6 +512,34 @@ class SQLSemanticAnalyzer:
             breakdown['injection_patterns'].append("tautology-string")
             evidence.append("String tautology with boolean operator")
 
+        # Pattern: Parenthesis-wrapped tautology — ') or ('1'='1
+        if re.search(r"\)\s*(or|and)\s*\(", text_clean, re.I):
+            if re.search(r"['\d]\s*=\s*['\d]", text_clean):
+                score += 3
+                structural_validity = True
+                if attack_type == AttackType.NONE:
+                    attack_type = AttackType.BOOLEAN_BASED
+                breakdown['injection_patterns'].append("paren-tautology")
+                evidence.append("Parenthesis-wrapped tautology bypass detected")
+
+        # Pattern: Weird equals obfuscation — '=' 'or'='
+        if re.search(r"'\s*=\s*'.*?(or|and)\s*'?\s*=\s*'?", text_clean, re.I):
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("equals-obfuscation")
+            evidence.append("Obfuscated equals-based tautology detected")
+
+        # Pattern: Comment-truncation after quote — admin'-- (login bypass)
+        if re.search(r"'\s*--\s*$", text_clean):
+            score += 2
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.COMMENT_TRUNCATION
+            breakdown['injection_patterns'].append("quote-comment-truncation")
+            evidence.append("Quote followed by comment truncation (login bypass)")
+
         # Pattern: UNION SELECT
         if re.search(r'\bunion\b.*\bselect\b', text_clean, re.I):
             score += 4
@@ -645,9 +673,15 @@ class SeverityClassifier:
 
     @classmethod
     def severity_to_action(cls, severity: Severity) -> Action:
-        """Map severity to recommended action."""
+        """Map severity to recommended action.
+
+        CRITICAL and HIGH attacks are always BLOCKED to prevent
+        destructive operations (DROP TABLE, xp_cmdshell, DELETE, etc.)
+        from reaching the database. ALERT is sent alongside BLOCK
+        via the incident logger for SOC notification.
+        """
         mapping = {
-            Severity.CRITICAL: Action.ALERT,
+            Severity.CRITICAL: Action.BLOCK,
             Severity.HIGH: Action.BLOCK,
             Severity.MEDIUM: Action.BLOCK,
             Severity.LOW: Action.CHALLENGE,
@@ -919,7 +953,7 @@ class SQLInjectionEnsemble:
         x = torch.LongTensor(encoded)
 
         with torch.no_grad():
-            prob = self.cnn_model(x)
+            prob = self.cnn_model.predict(x)
 
         return float(prob[0][0])
 
@@ -1146,9 +1180,8 @@ class SQLInjectionEnsemble:
         # Layer 5: Severity classification
         if decision == Decision.INJECTION:
             severity = self.severity_classifier.classify(attack_type, normalized_text)
-            # Override action based on severity
-            if severity == Severity.CRITICAL:
-                action = Action.ALERT
+            # INJECTION is always at least BLOCK; severity never downgrades action
+            action = Action.BLOCK
         elif decision == Decision.SUSPICIOUS:
             severity = Severity.LOW
         elif decision == Decision.INVALID:

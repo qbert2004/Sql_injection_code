@@ -1,0 +1,30 @@
+{
+  "model": "RandomForest",
+  "config": {
+    "n_estimators": 200,
+    "max_depth": 30,
+    "min_samples_split": 5,
+    "min_samples_leaf": 2,
+    "class_weight": "balanced",
+    "tfidf_analyzer": "char_wb",
+    "tfidf_ngram_range": [
+      2,
+      5
+    ],
+    "tfidf_max_features": 50000
+  },
+  "data": {
+    "train_size": 71142,
+    "test_size": 17786
+  },
+  "test_metrics": {
+    "accuracy": 0.991848,
+    "precision": 0.999625,
+    "recall": 0.982553,
+    "f1": 0.991016,
+    "roc_auc": 0.999697,
+    "fpr": 0.000311,
+    "fnr": 0.017447
+  },
+  "training_time_s": 4.7
+}
