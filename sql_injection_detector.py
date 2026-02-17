@@ -29,21 +29,22 @@ Usage:
     print(result['explanation'])       # Full decision trace
 """
 
-import re
+import hashlib
 import html
-import uuid
+import re
 import time
 import unicodedata
 import urllib.parse
-import numpy as np
-import joblib
-from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
-from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-from logger import get_logger, ensure_logging
+import joblib
+import numpy as np
+
+from logger import ensure_logging, get_logger
 
 ensure_logging()
 log = get_logger("sqli_detector")
@@ -152,7 +153,7 @@ class InputNormalizer:
     })
 
     @classmethod
-    def normalize(cls, text: str, max_length: int = 10000) -> Tuple[str, Dict[str, Any]]:
+    def normalize(cls, text: str, max_length: int = 10000) -> tuple[str, dict[str, Any]]:
         """
         Normalize input through the full pipeline.
 
@@ -251,7 +252,7 @@ class LexicalPreFilter:
     )
 
     @classmethod
-    def scan(cls, normalized_text: str) -> Dict[str, Any]:
+    def scan(cls, normalized_text: str) -> dict[str, Any]:
         """
         Fast lexical scan of normalized input.
 
@@ -403,7 +404,7 @@ class SQLSemanticAnalyzer:
         return False
 
     @classmethod
-    def analyze(cls, text: str) -> Dict[str, Any]:
+    def analyze(cls, text: str) -> dict[str, Any]:
         """
         Compute SQL semantic score with attack type classification.
 
@@ -430,18 +431,16 @@ class SQLSemanticAnalyzer:
 
         # ═══ HIGH-RISK SQL KEYWORDS (+3 each, context-checked) ═══
         for kw in cls.HIGH_RISK_KEYWORDS:
-            if re.search(rf'\b{re.escape(kw)}\b', text_normalized, re.I):
-                if cls._keyword_in_sql_context(kw, text_normalized):
-                    score += 3
-                    breakdown['high_risk_keywords'].append(kw)
+            if re.search(rf'\b{re.escape(kw)}\b', text_normalized, re.I) and cls._keyword_in_sql_context(kw, text_normalized):
+                score += 3
+                breakdown['high_risk_keywords'].append(kw)
 
         # ═══ MEDIUM-RISK KEYWORDS (+1 each, max +3, context-checked) ═══
         medium_count = 0
         for kw in cls.MEDIUM_RISK_KEYWORDS:
-            if re.search(rf'\b{re.escape(kw)}\b', text_normalized, re.I):
-                if cls._keyword_in_sql_context(kw, text_normalized):
-                    medium_count += 1
-                    breakdown['medium_risk_keywords'].append(kw)
+            if re.search(rf'\b{re.escape(kw)}\b', text_normalized, re.I) and cls._keyword_in_sql_context(kw, text_normalized):
+                medium_count += 1
+                breakdown['medium_risk_keywords'].append(kw)
         score += min(medium_count, 3)
 
         # ═══ SQL FUNCTIONS (+4 each) ═══
@@ -466,11 +465,10 @@ class SQLSemanticAnalyzer:
             breakdown['injection_patterns'].append("and-operator")
 
         # ═══ COMMENT PATTERNS (+2 each, context-checked) ═══
-        if '--' in text_clean:
-            # Only count if preceded by quote or SQL structure
-            if re.search(r"['\w;)]\s*--", text_clean):
-                score += 2
-                breakdown['comment_patterns'].append('--')
+        # Only count -- if preceded by quote or SQL structure
+        if '--' in text_clean and re.search(r"['\w;)]\s*--", text_clean):
+            score += 2
+            breakdown['comment_patterns'].append('--')
         if '/*' in text_clean or '*/' in text_clean:
             score += 2
             breakdown['comment_patterns'].append('/*...*/')
@@ -513,14 +511,13 @@ class SQLSemanticAnalyzer:
             evidence.append("String tautology with boolean operator")
 
         # Pattern: Parenthesis-wrapped tautology — ') or ('1'='1
-        if re.search(r"\)\s*(or|and)\s*\(", text_clean, re.I):
-            if re.search(r"['\d]\s*=\s*['\d]", text_clean):
-                score += 3
-                structural_validity = True
-                if attack_type == AttackType.NONE:
-                    attack_type = AttackType.BOOLEAN_BASED
-                breakdown['injection_patterns'].append("paren-tautology")
-                evidence.append("Parenthesis-wrapped tautology bypass detected")
+        if re.search(r"\)\s*(or|and)\s*\(", text_clean, re.I) and re.search(r"['\d]\s*=\s*['\d]", text_clean):
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("paren-tautology")
+            evidence.append("Parenthesis-wrapped tautology bypass detected")
 
         # Pattern: Weird equals obfuscation — '=' 'or'='
         if re.search(r"'\s*=\s*'.*?(or|and)\s*'?\s*=\s*'?", text_clean, re.I):
@@ -590,6 +587,40 @@ class SQLSemanticAnalyzer:
                 attack_type = AttackType.COMMENT_TRUNCATION
             evidence.append("Comment-based query truncation")
 
+        # Pattern: Double-quote injection (" OR "1"="1)
+        if re.search(r'"\s*(or|and)\s+"', text_clean, re.I):
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("double-quote-logic")
+            evidence.append("Double-quote boolean injection pattern detected")
+
+        # Pattern: Double-quote tautology ("1"="1, "a"="a)
+        if re.search(r'(or|and)\s+"(\w+)"\s*=\s*"\2"', text_clean, re.I):
+            score += 3
+            structural_validity = True
+            breakdown['injection_patterns'].append("double-quote-tautology")
+            evidence.append("Double-quote tautology detected")
+
+        # Pattern: ORDER BY injection (column enumeration)
+        if re.search(r'\border\s+by\s+\d+\s*(--|#|/\*)', text_clean, re.I):
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.UNION_BASED
+            breakdown['injection_patterns'].append("order-by-injection")
+            evidence.append("ORDER BY column enumeration (pre-UNION recon)")
+
+        # Pattern: ORDER BY injection without comment (context: after semicolon or quote)
+        if re.search(r"[';]\s*order\s+by\s+\d+", text_clean, re.I):
+            score += 2
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.UNION_BASED
+            breakdown['injection_patterns'].append("order-by-after-break")
+            evidence.append("ORDER BY after query break point")
+
         # Pattern: OUT-OF-BAND indicators
         if re.search(r'(load_file|into\s+outfile|into\s+dumpfile|utl_http|xp_dirtree)\b', text_clean, re.I):
             if attack_type in (AttackType.NONE, AttackType.OS_COMMAND):
@@ -618,7 +649,7 @@ class SQLSemanticAnalyzer:
 
     # Legacy alias for backward compatibility
     @classmethod
-    def calculate_semantic_score(cls, text: str) -> Dict[str, Any]:
+    def calculate_semantic_score(cls, text: str) -> dict[str, Any]:
         """Legacy method - delegates to analyze()."""
         result = cls.analyze(text)
         return {
@@ -712,17 +743,17 @@ class ExplainabilityModule:
         ensemble_score: float,
         P_rf: float,
         P_cnn: float,
-        semantic_result: Dict,
-        normalization_meta: Dict,
-        lexical_result: Dict,
+        semantic_result: dict,
+        normalization_meta: dict,
+        lexical_result: dict,
         decision_rule: str,
         detection_time_ms: float,
         input_hash: str,
-        source_ip: Optional[str] = None,
-        endpoint: Optional[str] = None,
-        field_name: Optional[str] = None,
-        http_method: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        source_ip: str | None = None,
+        endpoint: str | None = None,
+        field_name: str | None = None,
+        http_method: str | None = None,
+    ) -> dict[str, Any]:
         """Build full explainability output."""
         factors = []
         if ensemble_score >= 0.60:
@@ -757,8 +788,8 @@ class ExplainabilityModule:
         }
 
         siem_fields = {
-            'event_id': f"sqli-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{input_hash[:8]}",
-            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'event_id': f"sqli-{datetime.now(UTC).strftime('%Y%m%d')}-{input_hash[:8]}",
+            'timestamp': datetime.now(UTC).isoformat(),
             'event_category': 'intrusion_detection',
             'event_type': 'sql_injection',
             'event_severity': severity.value.lower(),
@@ -802,7 +833,7 @@ class ExplainabilityModule:
             return f"{type_desc} SQL injection detected with {confidence} confidence."
 
     @classmethod
-    def build_cef(cls, result: Dict) -> str:
+    def build_cef(cls, result: dict) -> str:
         """Build CEF (Common Event Format) string for SIEM."""
         siem = result.get('siem_fields', {})
         severity_map = {"info": 1, "low": 3, "medium": 6, "high": 8, "critical": 10}
@@ -842,7 +873,7 @@ class SQLInjectionEnsemble:
         ML score alone CANNOT produce INJECTION decision without semantic >= tau_semantic_min.
     """
 
-    def __init__(self, config: Optional[EnsembleConfig] = None):
+    def __init__(self, config: EnsembleConfig | None = None):
         self.config = config or EnsembleConfig()
         self.semantic_analyzer = SQLSemanticAnalyzer()
         self.normalizer = InputNormalizer()
@@ -903,7 +934,7 @@ class SQLInjectionEnsemble:
         return text.strip()
 
     @staticmethod
-    def extract_features(text: str) -> Dict[str, int]:
+    def extract_features(text: str) -> dict[str, int]:
         """Extract numeric features for RF model."""
         clean = SQLInjectionEnsemble.preprocess(text)
         return {
@@ -975,7 +1006,7 @@ class SQLInjectionEnsemble:
         return S
 
     def _ensemble_decision(self, P_rf: float, P_cnn: float,
-                           semantic: Dict) -> Dict[str, Any]:
+                           semantic: dict) -> dict[str, Any]:
         """
         Apply ensemble decision rules with semantic gating.
 
@@ -987,10 +1018,8 @@ class SQLInjectionEnsemble:
         cfg = self.config
         sem_score = semantic['score']
         has_semantics = semantic['has_sql_semantics']
-        attack_type = semantic.get('attack_type', AttackType.NONE)
 
         S = self._compute_ensemble_score(P_rf, P_cnn)
-        divergence = abs(P_cnn - P_rf)
 
         # === RULE 0: INVALID INPUT DETECTION ===
         # High CNN + Low RF + No SQL semantics = Malformed/garbage
@@ -1006,7 +1035,7 @@ class SQLInjectionEnsemble:
 
         # === RULE 1: HIGH CONFIDENCE INJECTION ===
         # Both ML and semantic agree
-        if S >= cfg.tau_high and has_semantics:
+        if cfg.tau_high <= S and has_semantics:
             return {
                 'decision': Decision.INJECTION,
                 'confidence_level': 'HIGH',
@@ -1051,20 +1080,19 @@ class SQLInjectionEnsemble:
             }
 
         # === RULE 4: CONFLICT ZONE WITH SEMANTICS ===
-        if S >= cfg.tau_low and has_semantics:
-            if P_cnn >= 0.50 or P_rf >= cfg.tau_rf_strong:
-                confidence = 'MEDIUM' if S < cfg.tau_high else 'HIGH'
-                return {
-                    'decision': Decision.INJECTION,
-                    'confidence_level': confidence,
-                    'score': S,
-                    'reason': f'Conflict zone with SQL semantics (P_rf={P_rf:.2f}, P_cnn={P_cnn:.2f}, sem={sem_score:.1f})',
-                    'action': Action.BLOCK,
-                    'rule': 'RULE_4_CONFLICT_WITH_SEMANTICS',
-                }
+        if cfg.tau_low <= S and has_semantics and (P_cnn >= 0.50 or P_rf >= cfg.tau_rf_strong):
+            confidence = 'MEDIUM' if cfg.tau_high > S else 'HIGH'
+            return {
+                'decision': Decision.INJECTION,
+                'confidence_level': confidence,
+                'score': S,
+                'reason': f'Conflict zone with SQL semantics (P_rf={P_rf:.2f}, P_cnn={P_cnn:.2f}, sem={sem_score:.1f})',
+                'action': Action.BLOCK,
+                'rule': 'RULE_4_CONFLICT_WITH_SEMANTICS',
+            }
 
         # === RULE 5: HIGH CONFIDENCE SAFE ===
-        if S < cfg.tau_safe:
+        if cfg.tau_safe > S:
             return {
                 'decision': Decision.SAFE,
                 'confidence_level': 'HIGH',
@@ -1097,9 +1125,9 @@ class SQLInjectionEnsemble:
 
     # ─── Main Detection API ───
 
-    def detect(self, text: str, source_ip: Optional[str] = None,
-               endpoint: Optional[str] = None, field_name: Optional[str] = None,
-               http_method: Optional[str] = None) -> Dict[str, Any]:
+    def detect(self, text: str, source_ip: str | None = None,
+               endpoint: str | None = None, field_name: str | None = None,
+               http_method: str | None = None) -> dict[str, Any]:
         """
         Detect SQL injection using the full 7-layer pipeline.
 
@@ -1129,7 +1157,6 @@ class SQLInjectionEnsemble:
         # Fast-path: clearly safe input (no SQL indicators at all)
         if not lexical['is_sql_like'] and not any(c in text for c in "'\"--;#"):
             elapsed = (time.time() - start_time) * 1000
-            import hashlib
             input_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
 
             return {
@@ -1167,8 +1194,8 @@ class SQLInjectionEnsemble:
         P_rf = self._predict_rf(text)
         P_cnn = self._predict_cnn(text) if self.cnn_loaded else P_rf
 
-        # Layer 3: Semantic validation
-        semantic = self.semantic_analyzer.analyze(text)
+        # Layer 3: Semantic validation (uses normalized text to defeat encoding evasion)
+        semantic = self.semantic_analyzer.analyze(normalized_text)
         attack_type = semantic['attack_type']
 
         # Layer 4: Decision engine
@@ -1190,8 +1217,6 @@ class SQLInjectionEnsemble:
             severity = Severity.INFO
 
         elapsed = (time.time() - start_time) * 1000
-
-        import hashlib
         input_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
 
         # Layer 6: Explainability
@@ -1252,7 +1277,7 @@ class SQLInjectionEnsemble:
 
         return final_result
 
-    def detect_batch(self, texts: List[str]) -> List[Dict[str, Any]]:
+    def detect_batch(self, texts: list[str]) -> list[dict[str, Any]]:
         """Detect SQL injection in multiple texts."""
         return [self.detect(text) for text in texts]
 
@@ -1266,7 +1291,7 @@ class SQLInjectionEnsemble:
         result = self.detect(text)
         return result['action'] in ('BLOCK', 'ALERT')
 
-    def get_cef(self, result: Dict) -> str:
+    def get_cef(self, result: dict) -> str:
         """Get CEF format string for a detection result."""
         return self.explainability.build_cef(result)
 
@@ -1283,7 +1308,7 @@ class SQLInjectionDetector:
         self.threshold = threshold
         self.model_loaded = self._ensemble.rf_loaded
 
-    def detect(self, text: str) -> Dict[str, Any]:
+    def detect(self, text: str) -> dict[str, Any]:
         P_rf = self._ensemble._predict_rf(text)
         is_injection = P_rf >= self.threshold
 
@@ -1304,7 +1329,7 @@ class SQLInjectionDetector:
 # ═══════════════════════════════════════════════════════════════════
 
 # Module-level singleton (prevents creating new detector per call)
-_default_detector: Optional[SQLInjectionEnsemble] = None
+_default_detector: SQLInjectionEnsemble | None = None
 
 
 def _get_detector() -> SQLInjectionEnsemble:
@@ -1315,7 +1340,7 @@ def _get_detector() -> SQLInjectionEnsemble:
     return _default_detector
 
 
-def detect_sql_injection(text: str) -> Dict[str, Any]:
+def detect_sql_injection(text: str) -> dict[str, Any]:
     """Quick detection using ensemble singleton (recommended)."""
     return _get_detector().detect(text)
 
@@ -1324,7 +1349,7 @@ def create_middleware():
     """Create middleware function for web frameworks."""
     detector = _get_detector()
 
-    def check_request(params: Dict[str, str]) -> Dict[str, Any]:
+    def check_request(params: dict[str, str]) -> dict[str, Any]:
         """Check all parameters for SQL injection."""
         blocked = False
         results = []

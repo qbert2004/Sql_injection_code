@@ -12,6 +12,7 @@ ENV/
 # IDEs
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 
@@ -40,6 +41,7 @@ build/
 # OS files
 .DS_Store
 Thumbs.db
+nul
 
 # Temporary files
 *.tmp

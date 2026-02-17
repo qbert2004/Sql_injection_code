@@ -15,7 +15,6 @@ Usage:
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
 from pathlib import Path
 
 try:
@@ -74,15 +73,20 @@ class ModelPaths:
 
 @dataclass(frozen=True)
 class APIConfig:
-    """API server configuration."""
+    """API server configuration.
+
+    SECURITY NOTE: In production, always set API_KEY env var and restrict
+    CORS_ORIGINS to your actual frontend domains.
+    Default cors_origins are restricted to localhost for development safety.
+    """
     host: str = "0.0.0.0"
     port: int = 5000
     debug: bool = False
     log_all_requests: bool = False
     enable_cors: bool = True
-    cors_origins: tuple = ("*",)
+    cors_origins: tuple = ("http://localhost:3000", "http://localhost:8501")
     rate_limit_per_minute: int = 100
-    api_key: Optional[str] = None
+    api_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,7 +94,7 @@ class LoggingConfig:
     """Logging configuration."""
     level: str = "INFO"
     format: str = "json"
-    log_file: Optional[str] = None
+    log_file: str | None = None
     enable_console: bool = True
     enable_structlog: bool = True
 
@@ -187,6 +191,11 @@ def get_config() -> AppConfig:
             log_all_requests=_env_bool("LOG_ALL_REQUESTS", False),
             rate_limit_per_minute=_env_int("RATE_LIMIT", 100),
             api_key=_env("API_KEY") or None,
+            cors_origins=tuple(
+                origin.strip()
+                for origin in _env("CORS_ORIGINS", "http://localhost:3000,http://localhost:8501").split(",")
+                if origin.strip()
+            ),
         ),
         logging=LoggingConfig(
             level=_env("LOG_LEVEL", "INFO"),
@@ -201,7 +210,7 @@ def get_config() -> AppConfig:
 
 
 # Module-level singleton
-_config: Optional[AppConfig] = None
+_config: AppConfig | None = None
 
 
 def config() -> AppConfig:

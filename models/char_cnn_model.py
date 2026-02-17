@@ -277,8 +277,14 @@ class CharCNN(nn.Module):
 
     @classmethod
     def load_from_checkpoint(cls, path: str, device: str = 'cpu') -> 'CharCNN':
-        """Load model from checkpoint file."""
-        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        """Load model from checkpoint file.
+
+        SECURITY NOTE: Uses weights_only=True to prevent arbitrary code execution
+        via malicious pickle payloads. Model files must contain only tensor data
+        and the model_config dict. If loading fails with an older .pt file,
+        re-export it using save_checkpoint().
+        """
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
         model = cls(**checkpoint['model_config'])
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()

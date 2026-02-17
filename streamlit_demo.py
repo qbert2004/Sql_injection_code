@@ -76,7 +76,7 @@ def get_decision_box(decision, action, confidence, severity, attack_type):
 
 def main():
     st.markdown('<p class="main-header">SQL Injection Ensemble Detector v3.0</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-header">RF + CNN + BiLSTM + Semantic Validation | Attack Typing | Severity | Explainability</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">RF + CNN + Semantic Validation | Attack Typing | Severity | Explainability</p>', unsafe_allow_html=True)
 
     with st.spinner("Loading ensemble models..."):
         detector = load_ensemble()
@@ -97,7 +97,7 @@ def main():
         st.markdown("""
         1. **L0: Normalization** — Unicode NFKC, URL decode, null strip
         2. **L1: Lexical Pre-filter** — Fast-path SAFE exit
-        3. **L2: ML Ensemble** — RF + CNN + BiLSTM
+        3. **L2: ML Ensemble** — RF + CNN
         4. **L3: Semantic Validation** — Attack typing
         5. **L4: Decision Engine** — Semantic-gated
         6. **L5: Severity** — Attack-type-aware
@@ -113,10 +113,6 @@ def main():
             st.success("CNN: Loaded")
         else:
             st.error("CNN: Not loaded")
-        if detector.bilstm_loaded:
-            st.success("BiLSTM: Loaded")
-        else:
-            st.warning("BiLSTM: Not loaded (2-model fallback)")
 
     # Main content
     col1, col2 = st.columns([2, 1])
@@ -129,7 +125,7 @@ def main():
     with col2:
         st.header("Thresholds")
         cfg = detector.config
-        st.metric("w_rf / w_cnn / w_bilstm", f"{cfg.w_rf}/{cfg.w_cnn}/{cfg.w_bilstm}")
+        st.metric("w_rf / w_cnn", f"{cfg.w_rf}/{cfg.w_cnn}")
         st.metric("Semantic Min", f"{cfg.tau_semantic_min}")
         st.metric("Semantic Override", f"{cfg.tau_semantic_override}")
 
@@ -168,7 +164,7 @@ def main():
 
         # Model probabilities
         st.markdown("### Model Probabilities")
-        cols = st.columns(4)
+        cols = st.columns(3)
         with cols[0]:
             st.metric("RF", f"{result['P_rf']:.2%}")
             st.progress(min(result['P_rf'], 1.0))
@@ -176,10 +172,6 @@ def main():
             st.metric("CNN", f"{result['P_cnn']:.2%}")
             st.progress(min(result['P_cnn'], 1.0))
         with cols[2]:
-            bilstm = result.get('P_bilstm', 0.0)
-            st.metric("BiLSTM", f"{bilstm:.2%}")
-            st.progress(min(bilstm, 1.0))
-        with cols[3]:
             sem_norm = min(result['semantic_score'] / 10, 1.0)
             st.metric("Semantic", f"{result['semantic_score']:.1f}")
             st.progress(sem_norm)
@@ -247,7 +239,7 @@ def main():
                 """)
 
     st.markdown("---")
-    st.caption("SQL Injection Ensemble Detection System v3.0 — RF + CNN + BiLSTM + Semantic Analysis")
+    st.caption("SQL Injection Ensemble Detection System v3.1 — RF + CNN + Semantic Analysis")
 
 
 if __name__ == "__main__":

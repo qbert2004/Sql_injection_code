@@ -1,0 +1,89 @@
+# ============================================================
+# SQL Injection Protector AI Agent — Project Configuration
+# ============================================================
+
+[project]
+name = "sql-injection-protector"
+version = "3.1.0"
+description = "Production-grade SQL injection detection with ML ensemble + semantic validation"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+readme = "README.md"
+
+# ═══ Ruff (linter + formatter) ═══
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "T20",  # flake8-print (catch debug prints)
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E402",   # module-level import not at top (needed for path setup)
+    "W293",   # whitespace before ':'
+    "W291",   # trailing whitespace
+    "B008",   # function call in default argument (Depends() in FastAPI)
+    "B905",   # zip without strict
+    "SIM105", # contextlib.suppress vs try-except-pass (readability preference)
+    "SIM108", # ternary operator (readability preference)
+    "T201",   # print statement (needed for CLI scripts)
+    "N802",   # function name lowercase (some ML naming conventions)
+    "N803",   # argument name lowercase (P_rf, P_cnn)
+    "N806",   # variable name lowercase (P_rf, P_cnn)
+    "UP007",  # Optional[X] -> X | None (keep for 3.11 compat)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["T20", "B011", "SIM"]    # allow prints and asserts in tests
+"training/*" = ["T20"]                  # allow prints in training scripts
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ═══ Mypy (type checking) ═══
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false          # gradual typing — don't enforce everywhere
+check_untyped_defs = true
+ignore_missing_imports = true          # third-party ML libs lack stubs
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = [
+    "sklearn.*",
+    "torch.*",
+    "streamlit.*",
+    "structlog.*",
+    "pandas.*",
+    "numpy.*",
+    "scipy.*",
+]
+ignore_missing_imports = true
+
+# ═══ Pytest ═══
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
