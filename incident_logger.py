@@ -20,14 +20,13 @@ Usage:
     stats = logger.get_statistics()
 """
 
-import sqlite3
-import json
 import hashlib
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional, Any
+import json
+import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from enum import Enum
+from typing import Any
 
 
 class IncidentSeverity(Enum):
@@ -51,7 +50,7 @@ class IncidentLogger:
 
     DEFAULT_DB_PATH = "incidents.db"
 
-    def __init__(self, db_path: Optional[str] = None, auto_cleanup_days: int = 90):
+    def __init__(self, db_path: str | None = None, auto_cleanup_days: int = 90):
         """
         Initialize incident logger.
 
@@ -68,9 +67,13 @@ class IncidentLogger:
 
     @contextmanager
     def _get_connection(self):
-        """Context manager for database connections"""
-        conn = sqlite3.connect(self.db_path)
+        """Context manager for database connections with hardened settings."""
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        # WAL mode: allows concurrent reads while writing, better for web servers
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Enforce foreign keys
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
             conn.commit()
@@ -179,14 +182,14 @@ class IncidentLogger:
     def log_incident(
         self,
         input_text: str,
-        result: Dict[str, Any],
-        source_ip: Optional[str] = None,
-        user_agent: Optional[str] = None,
-        endpoint: Optional[str] = None,
-        field_name: Optional[str] = None,
-        session_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        metadata: Optional[Dict] = None
+        result: dict[str, Any],
+        source_ip: str | None = None,
+        user_agent: str | None = None,
+        endpoint: str | None = None,
+        field_name: str | None = None,
+        session_id: str | None = None,
+        user_id: str | None = None,
+        metadata: dict | None = None
     ) -> int:
         """
         Log a detection incident.
@@ -246,14 +249,14 @@ class IncidentLogger:
         self,
         limit: int = 100,
         offset: int = 0,
-        decision: Optional[str] = None,
-        action: Optional[str] = None,
-        severity: Optional[str] = None,
-        source_ip: Optional[str] = None,
-        start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None,
+        decision: str | None = None,
+        action: str | None = None,
+        severity: str | None = None,
+        source_ip: str | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
         only_unreviewed: bool = False
-    ) -> List[Dict]:
+    ) -> list[dict]:
         """
         Query incidents with filters.
 
@@ -313,9 +316,9 @@ class IncidentLogger:
 
     def get_statistics(
         self,
-        start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None
-    ) -> Dict:
+        start_date: datetime | None = None,
+        end_date: datetime | None = None
+    ) -> dict:
         """
         Get aggregated statistics.
 
@@ -402,7 +405,7 @@ class IncidentLogger:
         self,
         incident_id: int,
         is_false_positive: bool,
-        reviewer_notes: Optional[str] = None
+        reviewer_notes: str | None = None
     ):
         """
         Mark an incident as false positive/negative for active learning.
@@ -426,7 +429,7 @@ class IncidentLogger:
         self,
         only_reviewed: bool = True,
         include_false_positives: bool = True
-    ) -> List[Dict]:
+    ) -> list[dict]:
         """
         Export data for model retraining (active learning).
 
@@ -473,7 +476,7 @@ class IncidentLogger:
     def export_to_siem(
         self,
         format: str = "json",
-        start_date: Optional[datetime] = None,
+        start_date: datetime | None = None,
         severity_min: str = "LOW"
     ) -> str:
         """
@@ -537,10 +540,23 @@ class IncidentLogger:
                 severity_map = {"INFO": 1, "LOW": 3, "MEDIUM": 6, "HIGH": 9}
                 sev = severity_map.get(inc.get("severity"), 5)
 
-                cef = f"CEF:0|SQLInjectionDetector|Agent|2.0|{inc.get('decision')}|SQL Injection Detection|{sev}|"
-                cef += f"src={inc.get('source_ip', 'unknown')} "
-                cef += f"msg={inc.get('reason', '')} "
-                cef += f"cs1={inc.get('input_text', '')[:100]} cs1Label=Input "
+                # CEF requires escaping: \ -> \\, | -> \|, = -> \= in extension values
+                # and newlines must be stripped to prevent log injection
+                def _cef_escape_header(val: str) -> str:
+                    return str(val).replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", "")
+
+                def _cef_escape_ext(val: str) -> str:
+                    return str(val).replace("\\", "\\\\").replace("=", "\\=").replace("\n", " ").replace("\r", "")
+
+                decision = _cef_escape_header(inc.get('decision', ''))
+                src_ip = _cef_escape_ext(inc.get('source_ip', 'unknown'))
+                reason = _cef_escape_ext(inc.get('reason', ''))
+                input_text = _cef_escape_ext(inc.get('input_text', '')[:100])
+
+                cef = f"CEF:0|SQLInjectionDetector|Agent|3.1|{decision}|SQL Injection Detection|{sev}|"
+                cef += f"src={src_ip} "
+                cef += f"msg={reason} "
+                cef += f"cs1={input_text} cs1Label=Input "
                 cef += f"cn1={inc.get('ensemble_score', 0)} cn1Label=Score"
 
                 cef_lines.append(cef)
@@ -572,10 +588,10 @@ class IncidentLogger:
 
 
 # Convenience function for quick logging
-_default_logger: Optional[IncidentLogger] = None
+_default_logger: IncidentLogger | None = None
 
 
-def get_logger(db_path: Optional[str] = None) -> IncidentLogger:
+def get_logger(db_path: str | None = None) -> IncidentLogger:
     """Get or create default incident logger"""
     global _default_logger
 
@@ -587,7 +603,7 @@ def get_logger(db_path: Optional[str] = None) -> IncidentLogger:
 
 def log_detection(
     input_text: str,
-    result: Dict,
+    result: dict,
     **metadata
 ) -> int:
     """

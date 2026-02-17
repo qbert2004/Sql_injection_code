@@ -1,0 +1,79 @@
+# ============================================================
+# SQL Injection Protector — Docker Compose (Development)
+# ============================================================
+# Usage:
+#   docker-compose up --build        # Build and start
+#   docker-compose up -d             # Detached mode
+#   docker-compose logs -f api       # Follow logs
+#   docker-compose down              # Stop and remove
+# ============================================================
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sqli-protector-api
+    ports:
+      - "${API_PORT:-5000}:5000"
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=production
+      - INCIDENTS_DB=/app/data/incidents.db
+    volumes:
+      # Persist incident database across restarts
+      - sqli-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+
+  # Optional: Prometheus monitoring
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: sqli-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      api:
+        condition: service_healthy
+    profiles:
+      - monitoring
+
+  # Optional: Streamlit demo UI
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sqli-protector-demo
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    command: ["streamlit", "run", "streamlit_demo.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    depends_on:
+      api:
+        condition: service_healthy
+    profiles:
+      - demo
+
+volumes:
+  sqli-data:
+    driver: local
+  prometheus-data:
+    driver: local

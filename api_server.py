@@ -20,32 +20,98 @@ Usage:
          -d '{"text": "admin\\'--"}'
 """
 
+import asyncio
+import ipaddress
 import time
-import html as html_module
-from typing import Optional, Dict, Any, List
+import traceback
+import uuid
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
-from sql_injection_detector import SQLInjectionEnsemble, ExplainabilityModule
-from incident_logger import IncidentLogger
 from config import get_config
+from incident_logger import IncidentLogger
 from logger import get_logger, setup_logging
+from metrics import metrics
+from sql_injection_detector import SQLInjectionEnsemble
 
 # ═══ Configuration ═══
 cfg = get_config()
 setup_logging(level=cfg.logging.level, format=cfg.logging.format)
 log = get_logger("api_server")
 
+# ═══ Constants ═══
+VERSION = "3.1.0"
+INFERENCE_TIMEOUT_SECONDS = 10  # Max time for a single detection call
+MAX_FIELDS = 50                 # Max fields per /api/validate request
+
+# Thread pool for CPU-bound inference (prevents blocking async event loop)
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sqli-inference")
+
+# ═══ Global State ═══
+detector: SQLInjectionEnsemble | None = None
+logger: IncidentLogger | None = None
+
+# Rate limiting (sliding window with deque for O(1) append/popleft)
+_rate_limit_store: dict[str, deque] = {}
+_rate_limit_last_cleanup: float = 0.0
+
+
+# ═══ Lifespan (startup + shutdown) ═══
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: initialize on startup, cleanup on shutdown."""
+    # ── Startup ──
+    global detector, logger
+    log.info("server_starting", port=cfg.api.port)
+
+    detector = SQLInjectionEnsemble()
+    logger = IncidentLogger(db_path=cfg.incidents.db_path)
+
+    if not cfg.api.api_key:
+        log.warning("api_key_not_set",
+                     msg="No API_KEY configured — all endpoints are publicly accessible. "
+                         "Set API_KEY env var for production.")
+
+    # Set Prometheus gauges
+    metrics.model_loaded.labels(model="rf").set(1 if detector.rf_loaded else 0)
+    metrics.model_loaded.labels(model="cnn").set(1 if detector.cnn_loaded else 0)
+    metrics.app_info.info({
+        "version": VERSION,
+        "rf_loaded": str(detector.rf_loaded),
+        "cnn_loaded": str(detector.cnn_loaded),
+    })
+
+    log.info("server_ready",
+             version=VERSION,
+             rf=detector.rf_loaded,
+             cnn=detector.cnn_loaded,
+             db=cfg.incidents.db_path)
+
+    yield  # ── App is running ──
+
+    # ── Shutdown ──
+    log.info("server_shutting_down")
+    _executor.shutdown(wait=True, cancel_futures=False)
+    log.info("server_stopped")
+
+
 # ═══ FastAPI App ═══
 app = FastAPI(
     title="SQL Injection Protector API",
     description="Production-grade SQL injection detection with ML ensemble + semantic validation.",
-    version="3.0.0",
+    version=VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # CORS
@@ -57,44 +123,186 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ═══ Global State ═══
-detector: Optional[SQLInjectionEnsemble] = None
-logger: Optional[IncidentLogger] = None
 
-# Rate limiting (simple in-memory)
-_rate_limit_store: Dict[str, list] = {}
+# ═══ Security Headers Middleware ═══
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Add security headers to all responses (OWASP recommendations)."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    # CSP only on HTML pages (demo), not API JSON responses
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+    return response
 
 
-@app.on_event("startup")
-async def startup():
-    """Initialize detector and logger on startup."""
-    global detector, logger
-    log.info("server_starting", port=cfg.api.port)
+# ═══ Request ID Middleware ═══
 
-    detector = SQLInjectionEnsemble()
-    logger = IncidentLogger(db_path=cfg.incidents.db_path)
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Attach a unique request ID for tracing and correlation."""
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
-    log.info("server_ready",
-             rf=detector.rf_loaded,
-             cnn=detector.cnn_loaded,
-             bilstm=detector.bilstm_loaded,
-             db=cfg.incidents.db_path)
+
+# ═══ Metrics Middleware ═══
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    """Track request count, duration, and active requests for Prometheus."""
+    endpoint = request.url.path
+    method = request.method
+
+    # Skip metrics endpoint itself to avoid recursion
+    if endpoint == "/metrics":
+        return await call_next(request)
+
+    metrics.active_requests.labels(endpoint=endpoint).inc()
+    start = time.time()
+
+    try:
+        response = await call_next(request)
+        duration = time.time() - start
+        status = response.status_code
+
+        metrics.requests_total.labels(endpoint=endpoint, method=method, status=status).inc()
+        metrics.request_duration.labels(endpoint=endpoint, method=method).observe(duration)
+
+        return response
+    except Exception:
+        duration = time.time() - start
+        metrics.requests_total.labels(endpoint=endpoint, method=method, status=500).inc()
+        metrics.request_duration.labels(endpoint=endpoint, method=method).observe(duration)
+        metrics.errors_total.labels(error_type="unhandled").inc()
+        raise
+    finally:
+        metrics.active_requests.labels(endpoint=endpoint).dec()
+
+
+# ═══ Global Exception Handler ═══
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch all unhandled exceptions and return structured error response."""
+    error_id = f"ERR-{int(time.time())}"
+    request_id = getattr(request.state, "request_id", "N/A")
+    log.error("unhandled_exception",
+              error_id=error_id,
+              request_id=request_id,
+              path=str(request.url.path),
+              method=request.method,
+              ip=get_client_ip(request),
+              error_type=type(exc).__name__,
+              error=str(exc),
+              traceback=traceback.format_exc())
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "error_id": error_id,
+            "request_id": request_id,
+            "detail": "An unexpected error occurred. Contact support with the error_id.",
+        },
+    )
+
+
+# ═══ Helpers ═══
+
+def _sanitize_log_value(value: str, max_len: int = 200) -> str:
+    """Sanitize a user-controlled value before including it in log entries.
+
+    Strips newlines (prevents log injection / CRLF attacks) and truncates
+    to avoid gigabyte-sized log lines.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    return value.replace("\n", "\\n").replace("\r", "\\r")[:max_len]
+
+
+async def _run_detection(text: str, **kwargs) -> dict[str, Any]:
+    """Run detector.detect() in thread pool with timeout to avoid blocking event loop."""
+    loop = asyncio.get_event_loop()
+    start = time.time()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(_executor, lambda: detector.detect(text, **kwargs)),
+            timeout=INFERENCE_TIMEOUT_SECONDS,
+        )
+        # Record inference latency
+        metrics.inference_duration.observe(time.time() - start)
+
+        # Record detection result
+        decision = result.get("decision", "UNKNOWN")
+        action = result.get("action", "UNKNOWN")
+        attack_type = result.get("attack_type", "NONE")
+        metrics.detections_total.labels(decision=decision, action=action, attack_type=attack_type).inc()
+        metrics.severity_total.labels(severity=result.get("severity", "INFO")).inc()
+
+        if action in ("BLOCK", "ALERT"):
+            metrics.blocked_total.inc()
+
+        return result
+    except TimeoutError as exc:
+        metrics.inference_timeouts.inc()
+        metrics.errors_total.labels(error_type="inference_timeout").inc()
+        log.error("inference_timeout", text_length=len(text), timeout=INFERENCE_TIMEOUT_SECONDS)
+        raise HTTPException(
+            status_code=504,
+            detail=f"Detection timed out after {INFERENCE_TIMEOUT_SECONDS}s"
+        ) from exc
+
+
+def _safe_log_incident(input_text: str, result: dict, **kwargs) -> int | None:
+    """Log incident with error handling — never crash the request if DB fails."""
+    try:
+        if logger:
+            return logger.log_incident(input_text=input_text, result=result, **kwargs)
+    except Exception as e:
+        log.error("incident_log_failed", error=str(e), decision=result.get("decision"))
+    return None
 
 
 # ═══ Dependencies ═══
 
 def get_client_ip(request: Request) -> str:
-    """Extract client IP from request headers."""
+    """Extract and validate client IP from request headers.
+
+    Validates that the IP is a well-formed address to prevent
+    header-injection attacks against the rate limiter.
+    """
+    raw_ip = "unknown"
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
+        raw_ip = forwarded.split(",")[0].strip()
+    elif request.client:
+        raw_ip = request.client.host
+
+    # Validate to prevent spoofed / garbage IPs from polluting rate-limit store
+    try:
+        ipaddress.ip_address(raw_ip)
+        return raw_ip
+    except ValueError:
+        return "unknown"
 
 
 def check_rate_limit(request: Request) -> None:
-    """Simple in-memory rate limiter."""
+    """Sliding-window rate limiter using deque (O(1) append/trim).
+
+    Tracks per-IP request timestamps in a deque and rejects if the window
+    contains more than ``rate_limit_per_minute`` entries.  Stale IPs are
+    pruned every 5 minutes to bound memory.
+    """
+    global _rate_limit_last_cleanup
+
     if cfg.api.rate_limit_per_minute <= 0:
         return
 
@@ -102,17 +310,31 @@ def check_rate_limit(request: Request) -> None:
     now = time.time()
     window = 60  # 1 minute
 
+    # Periodic cleanup of stale IPs (every 5 minutes)
+    if now - _rate_limit_last_cleanup > 300:
+        stale_ips = [
+            k for k, v in _rate_limit_store.items()
+            if not v or (now - v[-1]) > window
+        ]
+        for stale_ip in stale_ips:
+            del _rate_limit_store[stale_ip]
+        _rate_limit_last_cleanup = now
+
     if ip not in _rate_limit_store:
-        _rate_limit_store[ip] = []
+        _rate_limit_store[ip] = deque()
 
-    # Clean old entries
-    _rate_limit_store[ip] = [t for t in _rate_limit_store[ip] if now - t < window]
+    dq = _rate_limit_store[ip]
 
-    if len(_rate_limit_store[ip]) >= cfg.api.rate_limit_per_minute:
+    # Trim timestamps outside the sliding window from the left
+    while dq and (now - dq[0]) >= window:
+        dq.popleft()
+
+    if len(dq) >= cfg.api.rate_limit_per_minute:
+        metrics.rate_limit_exceeded.inc()
         log.warning("rate_limit_exceeded", ip=ip)
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-    _rate_limit_store[ip].append(now)
+    dq.append(now)
 
 
 def check_api_key(request: Request) -> None:
@@ -129,16 +351,16 @@ def check_api_key(request: Request) -> None:
 
 class CheckRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=10000, description="Text to analyze")
-    field_name: Optional[str] = Field(None, description="Field name for logging context")
+    field_name: str | None = Field(None, description="Field name for logging context")
 
 
 class ValidateRequest(BaseModel):
-    fields: Dict[str, str] = Field(..., description="Form fields to validate")
+    fields: dict[str, str] = Field(..., description="Form fields to validate")
 
 
 class FeedbackRequest(BaseModel):
     is_false_positive: bool = Field(..., description="True if the detection was a false positive")
-    notes: Optional[str] = Field(None, description="Reviewer notes")
+    notes: str | None = Field(None, description="Reviewer notes")
 
 
 class CheckResponse(BaseModel):
@@ -149,13 +371,13 @@ class CheckResponse(BaseModel):
     confidence: str
     severity: str
     attack_type: str
-    scores: Dict[str, float]
+    scores: dict[str, float]
     reason: str
     rule: str
     processing_time_ms: float
-    incident_id: Optional[int] = None
-    explanation: Optional[Dict] = None
-    siem_fields: Optional[Dict] = None
+    incident_id: int | None = None
+    explanation: dict | None = None
+    siem_fields: dict | None = None
 
 
 # ═══ Endpoints ═══
@@ -163,15 +385,21 @@ class CheckResponse(BaseModel):
 @app.get("/api/health", tags=["System"])
 async def health():
     """Health check endpoint with model status."""
+    incident_count = 0
+    if logger:
+        try:
+            incident_count = logger.get_incident_count()
+        except Exception:
+            pass  # health check should never fail due to DB
+
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": VERSION,
         "models": {
             "rf": detector.rf_loaded if detector else False,
             "cnn": detector.cnn_loaded if detector else False,
-            "bilstm": detector.bilstm_loaded if detector else False,
         },
-        "incidents_logged": logger.get_incident_count() if logger else 0,
+        "incidents_logged": incident_count,
         "config": {
             "rate_limit_per_minute": cfg.api.rate_limit_per_minute,
             "max_input_length": cfg.normalization.max_input_length,
@@ -191,7 +419,7 @@ async def check_single(req: CheckRequest, request: Request):
     client_ip = get_client_ip(request)
     start = time.time()
 
-    result = detector.detect(
+    result = await _run_detection(
         req.text,
         source_ip=client_ip,
         endpoint=str(request.url.path),
@@ -201,12 +429,12 @@ async def check_single(req: CheckRequest, request: Request):
 
     elapsed = (time.time() - start) * 1000
 
-    # Log incident
+    # Log incident (non-fatal on failure)
     should_log = result['action'] in ('BLOCK', 'ALERT', 'CHALLENGE') or cfg.api.log_all_requests
     incident_id = None
 
-    if should_log and logger:
-        incident_id = logger.log_incident(
+    if should_log:
+        incident_id = _safe_log_incident(
             input_text=req.text,
             result=result,
             source_ip=client_ip,
@@ -232,7 +460,6 @@ async def check_single(req: CheckRequest, request: Request):
             "ensemble": round(result["score"], 4),
             "rf": round(result["P_rf"], 4),
             "cnn": round(result["P_cnn"], 4),
-            "bilstm": round(result.get("P_bilstm", 0.0), 4),
             "semantic": result["semantic_score"],
         },
         reason=result["reason"],
@@ -244,6 +471,7 @@ async def check_single(req: CheckRequest, request: Request):
     )
 
     log.info("api_check",
+             request_id=getattr(request.state, "request_id", "N/A"),
              decision=result["decision"],
              action=result["action"],
              ip=client_ip,
@@ -263,13 +491,19 @@ async def validate_form(req: ValidateRequest, request: Request):
     client_ip = get_client_ip(request)
     start = time.time()
 
+    if len(req.fields) > MAX_FIELDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many fields: {len(req.fields)}. Maximum allowed: {MAX_FIELDS}"
+        )
+
     results = {}
     blocked_fields = []
     incident_ids = []
 
     for fname, fvalue in req.fields.items():
         if isinstance(fvalue, str) and len(fvalue) > 0:
-            result = detector.detect(
+            result = await _run_detection(
                 fvalue,
                 source_ip=client_ip,
                 endpoint=str(request.url.path),
@@ -287,8 +521,8 @@ async def validate_form(req: ValidateRequest, request: Request):
             if result["action"] in ("BLOCK", "ALERT"):
                 blocked_fields.append(fname)
 
-            if result["action"] in ("BLOCK", "ALERT", "CHALLENGE") and logger:
-                inc_id = logger.log_incident(
+            if result["action"] in ("BLOCK", "ALERT", "CHALLENGE"):
+                inc_id = _safe_log_incident(
                     input_text=fvalue,
                     result=result,
                     source_ip=client_ip,
@@ -296,7 +530,8 @@ async def validate_form(req: ValidateRequest, request: Request):
                     endpoint=str(request.url.path),
                     field_name=fname,
                 )
-                incident_ids.append(inc_id)
+                if inc_id:
+                    incident_ids.append(inc_id)
 
     elapsed = (time.time() - start) * 1000
 
@@ -315,7 +550,11 @@ async def get_stats():
     """Get incident statistics."""
     if not logger:
         raise HTTPException(status_code=503, detail="Logger not initialized")
-    return logger.get_statistics()
+    try:
+        return logger.get_statistics()
+    except Exception as e:
+        log.error("stats_query_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve statistics") from e
 
 
 @app.get("/api/incidents", tags=["Analytics"],
@@ -323,22 +562,26 @@ async def get_stats():
 async def get_incidents(
     limit: int = 50,
     offset: int = 0,
-    decision: Optional[str] = None,
-    action: Optional[str] = None,
-    severity: Optional[str] = None,
+    decision: str | None = None,
+    action: str | None = None,
+    severity: str | None = None,
 ):
     """Query incident history with filters and pagination."""
     if not logger:
         raise HTTPException(status_code=503, detail="Logger not initialized")
 
     limit = min(limit, 500)
-    incidents = logger.get_incidents(
-        limit=limit,
-        offset=offset,
-        decision=decision,
-        action=action,
-        severity=severity,
-    )
+    try:
+        incidents = logger.get_incidents(
+            limit=limit,
+            offset=offset,
+            decision=decision,
+            action=action,
+            severity=severity,
+        )
+    except Exception as e:
+        log.error("incidents_query_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve incidents") from e
 
     return {
         "incidents": incidents,
@@ -355,11 +598,15 @@ async def submit_feedback(incident_id: int, req: FeedbackRequest):
     if not logger:
         raise HTTPException(status_code=503, detail="Logger not initialized")
 
-    logger.mark_false_positive(
-        incident_id=incident_id,
-        is_false_positive=req.is_false_positive,
-        reviewer_notes=req.notes,
-    )
+    try:
+        logger.mark_false_positive(
+            incident_id=incident_id,
+            is_false_positive=req.is_false_positive,
+            reviewer_notes=req.notes,
+        )
+    except Exception as e:
+        log.error("feedback_failed", incident_id=incident_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to save feedback") from e
 
     log.info("feedback_submitted",
              incident_id=incident_id,
@@ -378,7 +625,11 @@ async def export_incidents(
     if not logger:
         raise HTTPException(status_code=503, detail="Logger not initialized")
 
-    export_data = logger.export_to_siem(format=format, severity_min=severity_min)
+    try:
+        export_data = logger.export_to_siem(format=format, severity_min=severity_min)
+    except Exception as e:
+        log.error("export_failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to export incidents") from e
 
     content_types = {
         "json": "application/json",
@@ -393,6 +644,15 @@ async def export_incidents(
     )
 
 
+@app.get("/metrics", tags=["Monitoring"])
+async def prometheus_metrics():
+    """Prometheus metrics endpoint for scraping."""
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
 @app.get("/api/demo", response_class=HTMLResponse, tags=["Demo"])
 async def demo():
     """Interactive demo page."""
@@ -400,7 +660,7 @@ async def demo():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>SQL Injection Detector v3.0 - Demo</title>
+        <title>SQL Injection Detector v3.1 - Demo</title>
         <style>
             body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 960px; margin: 50px auto; padding: 20px; background: #f8f9fa; }
             h1 { color: #1a1a2e; }
@@ -422,8 +682,8 @@ async def demo():
         </style>
     </head>
     <body>
-        <h1>SQL Injection Detection Agent v3.0</h1>
-        <p>Multi-layer ensemble: RF + CNN + BiLSTM + Semantic Validation | Attack Typing | Severity | Explainability</p>
+        <h1>SQL Injection Detection Agent v3.1</h1>
+        <p>Multi-layer ensemble: RF + CNN + Semantic Validation | Attack Typing | Severity | Explainability</p>
 
         <div class="input-group">
             <input type="text" id="input" placeholder="Enter text to check for SQL injection...">
@@ -475,7 +735,6 @@ async def demo():
                     '<p><b>Scores:</b> Ensemble=' + data.scores.ensemble +
                     ', RF=' + data.scores.rf +
                     ', CNN=' + data.scores.cnn +
-                    ', BiLSTM=' + data.scores.bilstm +
                     ', Semantic=' + data.scores.semantic + '</p>' +
                     '<p><b>Rule:</b> ' + data.rule + '</p>' +
                     '<p><b>Reason:</b> ' + safeReason + '</p>' +
@@ -501,7 +760,7 @@ if __name__ == "__main__":
     import uvicorn
 
     print("\n" + "=" * 60)
-    print("SQL Injection Protection API Server v3.0")
+    print(f"SQL Injection Protection API Server v{VERSION}")
     print("=" * 60)
     print(f"\nDocs:     http://localhost:{cfg.api.port}/docs")
     print(f"Demo:     http://localhost:{cfg.api.port}/api/demo")

@@ -11,13 +11,12 @@ Usage:
 
 import logging
 import sys
-from typing import Optional
 
 import structlog
 
 
 def setup_logging(level: str = "INFO", format: str = "json",
-                  log_file: Optional[str] = None,
+                  log_file: str | None = None,
                   enable_console: bool = True) -> None:
     """
     Configure structured logging for the application.

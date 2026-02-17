@@ -1,0 +1,71 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+tests/
+pytest.ini
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Data files (not needed in image)
+data/
+*.csv
+SQL_Dataset_Extended.csv
+incidents.db
+
+# Training (not needed in production)
+training/
+test_models.py
+global_test.py
+ultimate_test.py
+stress_test.py
+
+# Documentation
+*.md
+ARCHITECTURE_10_10.md
+
+# Environment
+.env
+.env.local
+.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# Logs
+*.log
+logs/
+
+# Temp
+*.tmp
+*.temp
+
+# Legacy Keras models (not used by ensemble)
+models/*.keras
+models/dl_tokenizer.pkl
