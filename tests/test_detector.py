@@ -353,7 +353,7 @@ class TestInputNormalizer:
     def test_comment_strip(self):
         from sql_injection_detector import InputNormalizer
         text, meta = InputNormalizer.normalize("UN/**/ION SE/**/LECT")
-        assert "un ion se lect" in text or "union select" in text.replace(" ", "").replace("  ", " ")
+        assert "union select" in text
 
     def test_max_length(self):
         from sql_injection_detector import InputNormalizer

@@ -134,23 +134,128 @@ class InputNormalizer:
     Pipeline:
         1. Length validation
         2. Unicode NFKC normalization (fullwidth → ASCII)
-        3. Recursive URL decode (max depth=3)
-        4. HTML entity decode
-        5. Null byte stripping
-        6. Inline comment removal
-        7. Whitespace collapse
+        3. Strip zero-width / invisible characters
+        4. Strip combining diacritics from ASCII-range base characters
+        5. Recursive URL decode (max depth=3)
+        6. HTML entity decode
+        7. Null byte stripping
         8. Lowercase
+        9. MySQL conditional comment expansion: /*!UNION*/ → UNION
+       10. Inline comment removal: UN/**/ION → UNION
+       11. Whitespace collapse
     """
 
-    # Common homoglyph mappings (fullwidth/special → ASCII)
+    # Comprehensive homoglyph mappings (fullwidth/special → ASCII)
     HOMOGLYPH_MAP = str.maketrans({
-        '\uff33': 'S', '\uff45': 'e', '\uff4c': 'l', '\uff25': 'E',
-        '\uff23': 'C', '\uff34': 'T', '\uff2f': 'O', '\uff32': 'R',
+        # Fullwidth uppercase A-Z (U+FF21 to U+FF3A)
+        **{chr(0xFF21 + i): chr(ord('A') + i) for i in range(26)},
+        # Fullwidth lowercase a-z (U+FF41 to U+FF5A)
+        **{chr(0xFF41 + i): chr(ord('a') + i) for i in range(26)},
+        # Fullwidth digits 0-9 (U+FF10 to U+FF19)
+        **{chr(0xFF10 + i): chr(ord('0') + i) for i in range(10)},
+        # Fullwidth punctuation
+        '\uff07': "'", '\uff02': '"', '\uff1b': ';', '\uff0d': '-',
+        '\uff08': '(', '\uff09': ')', '\uff1d': '=', '\uff1c': '<',
+        '\uff1e': '>', '\uff0c': ',', '\uff0e': '.', '\uff3b': '[',
+        '\uff3d': ']', '\uff5b': '{', '\uff5d': '}', '\uff0f': '/',
+        '\uff20': '@', '\uff03': '#', '\uff04': '$', '\uff05': '%',
+        '\uff06': '&', '\uff0a': '*', '\uff0b': '+', '\uff3f': '_',
+        # Smart quotes and special quote chars
         '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"',
-        '\uff07': "'", '\uff02': '"', '\u00b4': "'", '\u0060': "'",
-        '\uff1b': ';', '\uff0d': '-', '\uff08': '(', '\uff09': ')',
-        '\uff1d': '=', '\uff1c': '<', '\uff1e': '>',
+        '\u00b4': "'", '\u0060': "'", '\u02b9': "'", '\u02bc': "'",
     })
+
+    # Zero-width and invisible characters used for keyword splitting bypass
+    _ZERO_WIDTH_RE = re.compile(
+        '['
+        '\u200b'   # zero-width space
+        '\u200c'   # zero-width non-joiner
+        '\u200d'   # zero-width joiner
+        '\u200e'   # left-to-right mark
+        '\u200f'   # right-to-left mark
+        '\u2060'   # word joiner
+        '\u2061'   # function application
+        '\u2062'   # invisible times
+        '\u2063'   # invisible separator
+        '\u2064'   # invisible plus
+        '\ufeff'   # BOM / zero-width no-break space
+        '\u00ad'   # soft hyphen
+        '\u034f'   # combining grapheme joiner
+        '\u061c'   # arabic letter mark
+        '\u115f'   # hangul choseong filler
+        '\u1160'   # hangul jungseong filler
+        '\u17b4'   # khmer vowel inherent aq
+        '\u17b5'   # khmer vowel inherent aa
+        '\u180e'   # mongolian vowel separator
+        ']+'
+    )
+
+    # Math styled letter blocks → ASCII (Bold, Italic, Script, Fraktur, etc.)
+    @staticmethod
+    def _build_math_styled_map() -> dict[int, str]:
+        """Build translation table for Mathematical Alphanumeric Symbols."""
+        table = {}
+        # Each block: (start_codepoint, ascii_start_char, count)
+        math_blocks = [
+            (0x1D400, 'A', 26),  # Bold uppercase
+            (0x1D41A, 'a', 26),  # Bold lowercase
+            (0x1D434, 'A', 26),  # Italic uppercase
+            (0x1D44E, 'a', 26),  # Italic lowercase
+            (0x1D468, 'A', 26),  # Bold Italic uppercase
+            (0x1D482, 'a', 26),  # Bold Italic lowercase
+            (0x1D49C, 'A', 26),  # Script uppercase
+            (0x1D4B6, 'a', 26),  # Script lowercase
+            (0x1D4D0, 'A', 26),  # Bold Script uppercase
+            (0x1D4EA, 'a', 26),  # Bold Script lowercase
+            (0x1D504, 'A', 26),  # Fraktur uppercase
+            (0x1D51E, 'a', 26),  # Fraktur lowercase
+            (0x1D56C, 'A', 26),  # Bold Fraktur uppercase
+            (0x1D586, 'a', 26),  # Bold Fraktur lowercase
+            (0x1D5A0, 'A', 26),  # Sans-Serif uppercase
+            (0x1D5BA, 'a', 26),  # Sans-Serif lowercase
+            (0x1D5D4, 'A', 26),  # Sans-Serif Bold uppercase
+            (0x1D5EE, 'a', 26),  # Sans-Serif Bold lowercase
+            (0x1D608, 'A', 26),  # Sans-Serif Italic uppercase
+            (0x1D622, 'a', 26),  # Sans-Serif Italic lowercase
+            (0x1D63C, 'A', 26),  # Sans-Serif Bold Italic uppercase
+            (0x1D656, 'a', 26),  # Sans-Serif Bold Italic lowercase
+            (0x1D670, 'A', 26),  # Monospace uppercase
+            (0x1D68A, 'a', 26),  # Monospace lowercase
+            (0x1D7CE, '0', 10),  # Bold digits
+            (0x1D7D8, '0', 10),  # Double-struck digits
+            (0x1D7E2, '0', 10),  # Sans-Serif digits
+            (0x1D7EC, '0', 10),  # Sans-Serif Bold digits
+            (0x1D7F6, '0', 10),  # Monospace digits
+        ]
+        for start, ascii_start, count in math_blocks:
+            for i in range(count):
+                table[start + i] = chr(ord(ascii_start) + i)
+        return table
+
+    MATH_STYLED_MAP = str.maketrans(_build_math_styled_map.__func__())
+
+    @staticmethod
+    def _strip_combining_marks(text: str) -> str:
+        """Remove combining diacritical marks from ASCII base characters.
+
+        Handles evasion like S̀ELECT (S + combining grave accent) by stripping
+        the combining marks while preserving the base ASCII character.
+        Only strips marks that follow ASCII characters (0x00-0x7F) to avoid
+        destroying legitimate non-Latin text.
+        """
+        result = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            result.append(ch)
+            # If current char is ASCII, skip any combining marks that follow
+            if ord(ch) < 128:
+                i += 1
+                while i < len(text) and unicodedata.category(text[i]) == 'Mn':
+                    i += 1
+            else:
+                i += 1
+        return ''.join(result)
 
     @classmethod
     def normalize(cls, text: str, max_length: int = 10000) -> tuple[str, dict[str, Any]]:
@@ -178,13 +283,31 @@ class InputNormalizer:
             metadata['transformations'].append('unicode_nfkc')
         text = normalized
 
-        # 3. Homoglyph mapping
+        # 3. Homoglyph mapping (fullwidth → ASCII)
         mapped = text.translate(cls.HOMOGLYPH_MAP)
         if mapped != text:
             metadata['transformations'].append('homoglyph_map')
         text = mapped
 
-        # 4. Recursive URL decode (max depth=3)
+        # 4. Math styled Unicode → ASCII (Bold/Italic/Script/Fraktur/Monospace)
+        math_mapped = text.translate(cls.MATH_STYLED_MAP)
+        if math_mapped != text:
+            metadata['transformations'].append('math_styled_map')
+        text = math_mapped
+
+        # 5. Strip zero-width / invisible characters
+        stripped = cls._ZERO_WIDTH_RE.sub('', text)
+        if len(stripped) != len(text):
+            metadata['transformations'].append('zero_width_strip')
+        text = stripped
+
+        # 6. Strip combining diacritical marks from ASCII base chars
+        no_diacritics = cls._strip_combining_marks(text)
+        if no_diacritics != text:
+            metadata['transformations'].append('combining_mark_strip')
+        text = no_diacritics
+
+        # 7. Recursive URL decode (max depth=3)
         for depth in range(3):
             decoded = urllib.parse.unquote(text)
             if decoded == text:
@@ -192,24 +315,77 @@ class InputNormalizer:
             text = decoded
             metadata['transformations'].append(f'url_decode_depth_{depth + 1}')
 
-        # 5. HTML entity decode
+        # 8. HTML entity decode
         html_decoded = html.unescape(text)
         if html_decoded != text:
             metadata['transformations'].append('html_entity_decode')
         text = html_decoded
 
-        # 6. Null byte stripping
+        # 9. Null byte stripping
         if '\x00' in text:
             text = text.replace('\x00', '')
             metadata['transformations'].append('null_byte_strip')
 
-        # 7. Lowercase
+        # 10. Lowercase
         text = text.lower()
 
-        # 8. Inline comment removal (for semantic analysis)
-        text_no_comments = re.sub(r'/\*.*?\*/', ' ', text)
-        if text_no_comments != text:
+        # 11. MySQL conditional comment expansion: /*!UNION*/ → UNION
+        # Must run BEFORE general comment stripping so content is preserved.
+        # Handles /*!UNION*/, /*!50000UNION*/, and multi-word /*!50000UNION SELECT*/
+        expanded = re.sub(r'/\*!(\d*)(.*?)\*/', r'\2', text)
+        if expanded != text:
+            metadata['transformations'].append('mysql_conditional_expand')
+        text = expanded
+
+        # 12. Inline comment removal (reassembles split keywords:
+        # UN/**/ION → UNION, DR/**/OP → DROP)
+        # Use a callback to insert a space when comment sits between two
+        # word-characters (prevents SELECT/*a*/FROM → SELECTFROM merging)
+        # but remove entirely when touching non-word (DR/**/OP → DROP).
+        # Iterative stripping handles nested comments: UN/*/**/*/ION
+        _sql_keywords_for_merge = {
+            'select', 'union', 'insert', 'update', 'delete',
+            'drop', 'truncate', 'alter', 'create', 'exec',
+            'execute', 'table', 'from', 'where', 'having',
+            'group', 'order', 'sleep', 'benchmark', 'waitfor',
+            'concat', 'char', 'ascii', 'substring', 'between',
+            'values', 'into', 'like', 'null', 'grant', 'revoke',
+            'shutdown', 'schema', 'database', 'version',
+        }
+        had_comments = False
+        for _ in range(5):  # max 5 nesting levels
+            current_text = text
+
+            def _comment_replacer(m: re.Match, _src=current_text) -> str:
+                start, end = m.start(), m.end()
+                left_is_word = start > 0 and _src[start - 1].isalnum()
+                right_is_word = end < len(_src) and _src[end].isalnum()
+                if left_is_word and right_is_word:
+                    left_frag = _src[max(0, start - 10):start]
+                    right_frag = _src[end:end + 10]
+                    left_word = re.search(r'(\w+)$', left_frag)
+                    right_word = re.search(r'^(\w+)', right_frag)
+                    if left_word and right_word:
+                        merged = (left_word.group(1) + right_word.group(1)).lower()
+                        if merged in _sql_keywords_for_merge:
+                            return ''  # Merge: DR + OP → DROP
+                    return ' '  # Keep separated: SELECT + username → SELECT username
+                return ''  # Non-word boundary: remove entirely
+
+            text = re.sub(r'/\*.*?\*/', _comment_replacer, text)
+            if text == current_text:
+                break  # No more comments to strip
+            had_comments = True
+
+        if had_comments:
             metadata['transformations'].append('comment_strip')
+            # Strip orphan comment markers left by nested comment evasion
+            # (e.g. UN/*/**/*/ION → UN/*/ION → strip /*/ → UNION)
+            text = re.sub(r'/\*|\*/', '', text)
+        text_no_comments = text
+
+        # 13. Whitespace collapse
+        text_no_comments = re.sub(r'\s+', ' ', text_no_comments).strip()
 
         metadata['normalized_length'] = len(text_no_comments)
 
@@ -322,10 +498,11 @@ class SQLSemanticAnalyzer:
         'shutdown', 'create', 'alter', 'grant', 'revoke'
     ]
 
-    # Medium-risk keywords (logic manipulation)
+    # Medium-risk keywords (logic manipulation / query structure)
     MEDIUM_RISK_KEYWORDS = [
         'or', 'and', 'where', 'from', 'having', 'group', 'order',
-        'like', 'between', 'in', 'is', 'null', 'not', 'exists'
+        'like', 'between', 'in', 'is', 'null', 'not', 'exists',
+        'table', 'into', 'values', 'set',
     ]
 
     # SQL functions (with opening paren to avoid false match)
@@ -379,9 +556,25 @@ class SQLSemanticAnalyzer:
 
     @classmethod
     def _keyword_in_sql_context(cls, keyword: str, text: str) -> bool:
-        """Check if a SQL keyword appears in SQL structural context (not English prose)."""
-        # Find all occurrences
+        """Check if a SQL keyword appears in SQL structural context (not English prose).
+
+        A keyword is considered "in SQL context" when it appears near SQL
+        structural operators (=, ;, quotes, parentheses, --) OR near a
+        sufficient density of other SQL keywords.  Plain English sentences
+        that happen to contain several SQL keywords (e.g. "Please select
+        items from the drop-down list and update or delete entries") must
+        NOT trigger this check.
+
+        Heuristics applied:
+            1. SQL operators within a ±30-char window → immediate SQL context.
+            2. ≥2 other SQL keywords in window → SQL context.
+            3. Only 1 other SQL keyword in window → SQL context ONLY if
+               the text is short (≤60 chars) — long prose naturally
+               accumulates SQL keywords without being an attack.
+        """
         pattern = re.compile(rf'\b{re.escape(keyword)}\b', re.I)
+        is_long_text = len(text) > 60
+
         for m in pattern.finditer(text):
             pos = m.start()
             window_start = max(0, pos - 30)
@@ -392,13 +585,18 @@ class SQLSemanticAnalyzer:
             if re.search(r"[=;'\"()\-]{2}", window):
                 return True
 
-            # Keyword near other SQL keywords
+            # Keyword near other SQL keywords — require higher density
+            # for longer text to avoid false positives on English prose
             other_sql = ['select', 'from', 'where', 'union', 'insert', 'update',
                          'delete', 'drop', 'or', 'and', 'table', 'into', 'values',
                          'set', 'exec', 'null', 'sleep', 'benchmark']
             nearby_count = sum(1 for k in other_sql
                                if k != keyword.lower() and re.search(rf'\b{k}\b', window, re.I))
-            if nearby_count >= 1:
+
+            # For long text: require ≥2 nearby SQL keywords (single co-occurrence
+            # in prose is normal, e.g. "select ... from the list")
+            min_nearby = 2 if is_long_text else 1
+            if nearby_count >= min_nearby:
                 return True
 
         return False
@@ -528,6 +726,18 @@ class SQLSemanticAnalyzer:
             breakdown['injection_patterns'].append("equals-obfuscation")
             evidence.append("Obfuscated equals-based tautology detected")
 
+        # Pattern: Bare equals between quotes — '=' ' or '= ' (minimal auth bypass)
+        # Matches various spacings: '='  ,  ' = ' ,  ' =' etc.
+        # Guard: only when there are exactly 2-3 quotes total (avoids ''''=''' garbage)
+        _quote_count = text_clean.count("'")
+        if re.search(r"'\s*=\s*'", text_clean) and len(text_clean.strip()) <= 10 and _quote_count <= 3:
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("bare-equals-bypass")
+            evidence.append("Bare quote-equals-quote auth bypass")
+
         # Pattern: Comment-truncation after quote — admin'-- (login bypass)
         if re.search(r"'\s*--\s*$", text_clean):
             score += 2
@@ -538,12 +748,28 @@ class SQLSemanticAnalyzer:
             evidence.append("Quote followed by comment truncation (login bypass)")
 
         # Pattern: UNION SELECT
-        if re.search(r'\bunion\b.*\bselect\b', text_clean, re.I):
-            score += 4
-            structural_validity = True
-            attack_type = AttackType.UNION_BASED
-            breakdown['injection_patterns'].append("union-select")
-            evidence.append("UNION SELECT data extraction attempt")
+        # Guard: In natural-language text, "union" and "select" may both appear
+        # as normal English words (e.g. "The European Union voted to select...").
+        # Heuristic: if the gap between them contains only non-SQL English words
+        # (no digits, no parens, no commas, no *, no null) AND the overall text
+        # is long (>40 chars), treat as prose.  SQL UNION SELECT payloads use
+        # "union select col1,col2" or "union all select" patterns where the gap
+        # is either whitespace, "all", or nothing.
+        _union_select_match = re.search(r'\bunion\b(.*?)\bselect\b', text_clean, re.I)
+        if _union_select_match:
+            _gap_text = _union_select_match.group(1).strip()
+            _gap_is_sql = (
+                _gap_text == ''
+                or re.match(r'^(all\s*)?$', _gap_text, re.I)
+                or re.search(r'[0-9()*,]', _gap_text)
+            )
+            _is_prose = len(text_clean) > 40 and not _gap_is_sql
+            if not _is_prose:
+                score += 4
+                structural_validity = True
+                attack_type = AttackType.UNION_BASED
+                breakdown['injection_patterns'].append("union-select")
+                evidence.append("UNION SELECT data extraction attempt")
         elif re.search(r'union\s*select', text_normalized, re.I):
             score += 4
             structural_validity = True
@@ -603,6 +829,51 @@ class SQLSemanticAnalyzer:
             breakdown['injection_patterns'].append("double-quote-tautology")
             evidence.append("Double-quote tautology detected")
 
+        # Pattern: Bracket-delimited tautology — [1]=[1], [a]=[a] (MSSQL style)
+        if re.search(r"(or|and)\s+\[([^\]]+)\]\s*=\s*\[\2\]", text_clean, re.I):
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("bracket-tautology")
+            evidence.append("Bracket-delimited tautology (MSSQL style)")
+
+        # Pattern: Subquery comparison — (SELECT ...)=value (blind injection)
+        if re.search(r"\(\s*select\b[^)]*\)\s*[=<>!]", text_clean, re.I):
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("subquery-comparison")
+            evidence.append("Subquery used in comparison (blind injection)")
+
+        # Pattern: EXISTS subquery — WHERE EXISTS(SELECT ...)
+        if re.search(r"\bexists\s*\(\s*select\b", text_clean, re.I):
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("exists-subquery")
+            evidence.append("EXISTS subquery injection")
+
+        # Pattern: LIKE with wildcard after injection break-in — ' OR col LIKE '%
+        if re.search(r"(or|and)\s+\w+\s+like\s+['\"]%", text_clean, re.I):
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("like-wildcard")
+            evidence.append("LIKE with wildcard pattern (match-all bypass)")
+
+        # Pattern: IF/IIF conditional tautology — IF(1=1,...) used for blind injection
+        if re.search(r"\b(if|iif)\s*\(\s*\d+\s*=\s*\d+\s*,", text_clean, re.I):
+            score += 4
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("if-tautology")
+            evidence.append("IF/IIF conditional tautology (blind injection)")
+
         # Pattern: ORDER BY injection (column enumeration)
         if re.search(r'\border\s+by\s+\d+\s*(--|#|/\*)', text_clean, re.I):
             score += 3
@@ -626,6 +897,38 @@ class SQLSemanticAnalyzer:
             if attack_type in (AttackType.NONE, AttackType.OS_COMMAND):
                 attack_type = AttackType.OUT_OF_BAND
             evidence.append("Out-of-band data exfiltration technique")
+
+        # ═══ STANDALONE SQL STATEMENT DETECTION ═══
+        # A bare SQL statement (e.g. "SELECT * FROM users WHERE id = 1") without
+        # any injection break-in context (no quotes before keywords, no stacked
+        # query separator, no tautology) is likely documentation or educational
+        # content, NOT an injection attempt.  Downgrade score in this case.
+        #
+        # Exception: comment truncation (--) with destructive keywords (DROP,
+        # DELETE, TRUNCATE) IS an injection pattern, not documentation.
+        has_break_in = (
+            "'" in text_clean or '"' in text_clean
+            or re.search(r';\s*(select|drop|delete|insert|update|exec|truncate|shutdown)', text_clean, re.I)
+            or len(breakdown['injection_patterns']) > 0
+            or len(breakdown['sql_functions']) > 0
+        )
+        # Destructive SQL keyword + comment truncation = attack, not documentation
+        destructive_with_comment = (
+            any(kw in ('drop', 'delete', 'truncate', 'alter', 'shutdown', 'exec', 'execute')
+                for kw in breakdown['high_risk_keywords'])
+            and len(breakdown['comment_patterns']) > 0
+        )
+        if destructive_with_comment:
+            has_break_in = True
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.STACKED_QUERY
+            evidence.append("Destructive SQL keyword with comment truncation")
+
+        if score >= 2 and not has_break_in and not structural_validity:
+            # Pure SQL keywords without injection context → documentation
+            score = min(score, 1.0)
+            evidence.append("Standalone SQL statement (no injection break-in context)")
 
         # ═══ STRUCTURAL VALIDITY CHECK ═══
         if score >= 2 and not structural_validity:
@@ -1034,8 +1337,30 @@ class SQLInjectionEnsemble:
             }
 
         # === RULE 1: HIGH CONFIDENCE INJECTION ===
-        # Both ML and semantic agree
+        # Both ML and semantic agree.
+        # GUARD: When models strongly disagree (CNN high / RF low), the
+        # ensemble score can still exceed tau_high due to CNN's higher
+        # weight (0.65).  In long natural-language inputs, CNN may fire
+        # on embedded SQL-like substrings ("SELECT ... FROM ...") while
+        # RF correctly identifies the overall input as prose.  We demote
+        # to SUSPICIOUS when:
+        #   • models diverge (|P_cnn - P_rf| > tau_model_divergence)
+        #   • RF is confident the input is safe (P_rf < tau_safe)
+        #   • the input lacks strong injection patterns (no structural
+        #     validity from the semantic analyzer)
+        models_diverge = abs(P_cnn - P_rf) > cfg.tau_model_divergence
+        rf_says_safe = P_rf < cfg.tau_safe
+
         if cfg.tau_high <= S and has_semantics:
+            if models_diverge and rf_says_safe and not semantic.get('structural_validity', False):
+                return {
+                    'decision': Decision.SUSPICIOUS,
+                    'confidence_level': 'LOW',
+                    'score': S,
+                    'reason': f'Model divergence guard: P_cnn={P_cnn:.2f} vs P_rf={P_rf:.2f} (RF says safe, no structural attack patterns)',
+                    'action': Action.CHALLENGE,
+                    'rule': 'RULE_1_DIVERGENCE_GUARD',
+                }
             return {
                 'decision': Decision.INJECTION,
                 'confidence_level': 'HIGH',
@@ -1046,7 +1371,18 @@ class SQLInjectionEnsemble:
             }
 
         # === RULE 2: CNN OVERRIDE (obfuscation) ===
+        # Same divergence guard: if RF is confident it's safe and there
+        # are no structural attack patterns, demote to SUSPICIOUS.
         if P_cnn >= cfg.tau_cnn_override and sem_score >= 3:
+            if rf_says_safe and not semantic.get('structural_validity', False):
+                return {
+                    'decision': Decision.SUSPICIOUS,
+                    'confidence_level': 'LOW',
+                    'score': S,
+                    'reason': f'CNN override guarded: P_cnn={P_cnn:.2f} but P_rf={P_rf:.2f} (RF says safe, no structural patterns)',
+                    'action': Action.CHALLENGE,
+                    'rule': 'RULE_2_CNN_OVERRIDE_GUARDED',
+                }
             return {
                 'decision': Decision.INJECTION,
                 'confidence_level': 'HIGH',
@@ -1068,13 +1404,27 @@ class SQLInjectionEnsemble:
             }
 
         # === RULE 3.5: SEMANTIC OVERRIDE ===
-        # Very high semantic score catches attacks that fool ML
-        if sem_score >= cfg.tau_semantic_override:
+        # Very high semantic score catches attacks that fool ML (e.g. comment-split
+        # keywords like UN/**/ION SE/**/LECT, hex encoding, MySQL conditional comments).
+        #
+        # Two modes:
+        #   a) sem >= override AND structural_validity → INJECTION regardless of ML.
+        #      This catches heavily obfuscated payloads where confirmed SQL attack
+        #      patterns (tautologies, UNION SELECT, stacked queries) are present
+        #      but ML was never trained on the encoding variant.
+        #   b) sem >= override AND S >= tau_safe → INJECTION (soft ML gate).
+        #      This is the fallback for cases where structural patterns are ambiguous
+        #      but ML at least doesn't confidently say safe.
+        #
+        # The ML gate in mode (b) prevents false positives on natural language with
+        # many SQL keywords (e.g. "The union between France and Germany was strong").
+        has_structural = semantic.get('structural_validity', False)
+        if sem_score >= cfg.tau_semantic_override and (has_structural or S >= cfg.tau_safe):
             return {
                 'decision': Decision.INJECTION,
-                'confidence_level': 'MEDIUM',
+                'confidence_level': 'MEDIUM' if not has_structural else 'HIGH',
                 'score': S,
-                'reason': f'Semantic override: sem={sem_score:.1f} >= {cfg.tau_semantic_override}',
+                'reason': f'Semantic override: sem={sem_score:.1f} >= {cfg.tau_semantic_override}, structural={has_structural}',
                 'action': Action.BLOCK,
                 'rule': 'RULE_3_5_SEMANTIC_OVERRIDE',
             }
@@ -1155,7 +1505,15 @@ class SQLInjectionEnsemble:
         lexical = self.lexical_filter.scan(normalized_text)
 
         # Fast-path: clearly safe input (no SQL indicators at all)
-        if not lexical['is_sql_like'] and not any(c in text for c in "'\"--;#"):
+        # Also skip fast-path if normalizer detected evasion techniques
+        # (comment stripping, zero-width chars, etc.) — those are suspicious.
+        evasion_transforms = {'comment_strip', 'mysql_conditional_expand',
+                              'zero_width_strip', 'combining_mark_strip',
+                              'math_styled_map', 'homoglyph_map', 'unicode_nfkc'}
+        had_evasion = bool(evasion_transforms & set(norm_meta['transformations']))
+        if (not lexical['is_sql_like'] and not had_evasion
+                and not any(c in text for c in "'\"--;#")
+                and '/*' not in text):
             elapsed = (time.time() - start_time) * 1000
             input_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
 
@@ -1196,6 +1554,28 @@ class SQLInjectionEnsemble:
 
         # Layer 3: Semantic validation (uses normalized text to defeat encoding evasion)
         semantic = self.semantic_analyzer.analyze(normalized_text)
+
+        # If the normalizer detected active evasion (zero-width chars, math-styled
+        # Unicode, comment splitting, etc.), the "standalone SQL" downgrade that caps
+        # sem to 1.0 is wrong — obfuscated SQL is an attack, not documentation.
+        # Re-score without the downgrade by checking for evasion + capped score.
+        if had_evasion and semantic['score'] <= 1.0 and len(semantic['breakdown']['high_risk_keywords']) > 0:
+            # The presence of high-risk keywords + active evasion = attack
+            uncapped_score = 0.0
+            uncapped_score += len(semantic['breakdown']['high_risk_keywords']) * 3
+            uncapped_score += min(len(semantic['breakdown']['medium_risk_keywords']), 3)
+            uncapped_score += len(semantic['breakdown']['sql_functions']) * 4
+            uncapped_score += len(semantic['breakdown']['comment_patterns']) * 2
+            # Add bonus for evasion itself
+            uncapped_score += 2  # evasion detection bonus
+            semantic['score'] = uncapped_score
+            semantic['has_sql_semantics'] = uncapped_score >= 2
+            semantic['structural_validity'] = True
+            semantic['evidence'].append(
+                f"Evasion detected ({', '.join(t for t in norm_meta['transformations'] if t in evasion_transforms)}) "
+                f"— standalone SQL downgrade reversed"
+            )
+
         attack_type = semantic['attack_type']
 
         # Layer 4: Decision engine
