@@ -14,17 +14,17 @@
     "tfidf_max_features": 50000
   },
   "data": {
-    "train_size": 71142,
-    "test_size": 17786
+    "train_size": 92336,
+    "test_size": 23085
   },
   "test_metrics": {
-    "accuracy": 0.991848,
-    "precision": 0.999625,
-    "recall": 0.982553,
-    "f1": 0.991016,
-    "roc_auc": 0.999697,
-    "fpr": 0.000311,
-    "fnr": 0.017447
+    "accuracy": 0.992549,
+    "precision": 0.999697,
+    "recall": 0.983239,
+    "f1": 0.9914,
+    "roc_auc": 0.999808,
+    "fpr": 0.000231,
+    "fnr": 0.016761
   },
-  "training_time_s": 4.7
+  "training_time_s": 51.9
 }

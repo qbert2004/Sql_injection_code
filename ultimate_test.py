@@ -292,6 +292,90 @@ test_cases = [
     ("'test'='test", "Invalid: incomplete"),
 
     # ============================================================
+    # COMMENT-SPLIT KEYWORD BYPASS (must BLOCK)
+    # ============================================================
+    ("UN/**/ION/**/SE/**/LECT/**/NULL--", "Comment-split: UNION SELECT"),
+    ("' UN/**/ION SE/**/LECT NULL--", "Comment-split: with quote"),
+    ("' UNI/**/ON SEL/**/ECT 1,2,3--", "Comment-split: partial split"),
+    ("DR/**/OP TA/**/BLE users--", "Comment-split: DROP TABLE"),
+    ("' AND SL/**/EEP(5)--", "Comment-split: SLEEP"),
+    ("' DEL/**/ETE FR/**/OM users--", "Comment-split: DELETE FROM"),
+    ("' IN/**/SERT IN/**/TO users VALUES('x')--", "Comment-split: INSERT"),
+    ("' UP/**/DATE users SET pass='x'--", "Comment-split: UPDATE"),
+
+    # ============================================================
+    # MYSQL CONDITIONAL COMMENTS (must BLOCK)
+    # ============================================================
+    ("' /*!UNION*/ /*!SELECT*/ NULL--", "MySQL cond: UNION SELECT"),
+    ("' /*!50000UNION*/ /*!50000SELECT*/ NULL--", "MySQL cond: versioned"),
+    ("/*!UNION*//*!SELECT*/NULL--", "MySQL cond: no space"),
+    ("' /*!UNION*/ /*!SELECT*/ username FROM users--", "MySQL cond: data extract"),
+
+    # ============================================================
+    # FULLWIDTH UNICODE BYPASS (must BLOCK)
+    # ============================================================
+    ("\uff27' \uff2f\uff32 '1'='1", "Fullwidth: OR with G prefix"),
+    ("' \uff35\uff2e\uff29\uff2f\uff2e \uff33\uff25\uff2c\uff25\uff23\uff34 NULL--", "Fullwidth: UNION SELECT"),
+    ("' \uff2f\uff32 1=1--", "Fullwidth: OR 1=1"),
+
+    # ============================================================
+    # NO-QUOTE NUMERIC CONTEXT (must BLOCK)
+    # ============================================================
+    ("1 OR 1=1--", "Numeric: simple OR tautology"),
+    ("-1 UNION SELECT NULL,NULL--", "Numeric: negative UNION"),
+    ("0 UNION SELECT username FROM users--", "Numeric: zero UNION"),
+    ("1; DROP TABLE users--", "Numeric: stacked DROP"),
+    ("1 AND SLEEP(5)--", "Numeric: AND SLEEP"),
+    ("999 OR 1=1 LIMIT 1--", "Numeric: with LIMIT"),
+
+    # ============================================================
+    # LIKE/REGEXP/BETWEEN BYPASS (must BLOCK)
+    # ============================================================
+    ("' OR 'x' LIKE 'x'--", "Like: string LIKE"),
+    ("' OR 1 REGEXP '.*'--", "Regexp: any match"),
+    ("' OR 1 RLIKE 1--", "Rlike: MySQL"),
+    ("' OR 1 BETWEEN 0 AND 2--", "Between: range tautology"),
+    ("' OR 1 IN (1,2,3)--", "In: list match"),
+    ("' OR 1 GLOB 1--", "Glob: SQLite"),
+    ("' OR 1 IS NOT NULL--", "IsNotNull: tautology"),
+
+    # ============================================================
+    # HEX/CHAR ENCODING (must BLOCK)
+    # ============================================================
+    ("' OR CHAR(49)=CHAR(49)--", "Char: encoded tautology"),
+    ("' OR 0x61=0x61--", "Hex: encoded tautology"),
+    ("' AND ASCII(SUBSTRING(version(),1,1))>48--", "Ascii: blind extraction"),
+    ("' OR UNHEX('31')='1'--", "Unhex: encoded value"),
+    ("' UNION SELECT 0x757365726E616D65--", "Hex: UNION with hex string"),
+
+    # ============================================================
+    # NESTED SUBQUERY (must BLOCK)
+    # ============================================================
+    ("' AND EXISTS(SELECT * FROM users WHERE username='admin')--", "Nested: EXISTS"),
+    ("' OR 1 IN (SELECT 1)--", "Nested: IN subquery"),
+    ("' AND 1=(SELECT 1 FROM users LIMIT 1)--", "Nested: equality subquery"),
+    ("' AND CASE WHEN (SELECT COUNT(*) FROM users)>0 THEN 1 ELSE 0 END=1--", "Nested: CASE WHEN"),
+
+    # ============================================================
+    # WAF BYPASS ADVANCED (must BLOCK)
+    # ============================================================
+    ("'\tOR\t1=1--", "WAF-adv: tab whitespace"),
+    ("'\nOR\n1=1--", "WAF-adv: newline whitespace"),
+    ("' UNION SELECT `username` FROM `users`--", "WAF-adv: backtick delimiters"),
+    ("' UNION SELECT [username] FROM [users]--", "WAF-adv: bracket delimiters"),
+    ("' OR (((((1=1)))))--", "WAF-adv: excess parentheses"),
+
+    # ============================================================
+    # SCIENTIFIC/EXOTIC TAUTOLOGIES (must BLOCK)
+    # ============================================================
+    ("' OR 1e0=1e0--", "Exotic: scientific notation"),
+    ("' OR 0x1=0x1--", "Exotic: hex tautology"),
+    ("' OR NOT 0--", "Exotic: NOT false"),
+    ("' XOR 1=1--", "Exotic: XOR"),
+    ("' OR 1 DIV 1--", "Exotic: DIV"),
+    ("' OR (SELECT 1)=1--", "Exotic: subselect tautology"),
+
+    # ============================================================
     # ADVERSARIAL - designed to fool ML
     # ============================================================
     ("The password1=1 is strong", "Adversarial: 1=1 in text"),
@@ -307,6 +391,14 @@ test_cases = [
     ("The sleep timer is set", "Adversarial: sleep word"),
     ("NULL values are ignored", "Adversarial: NULL word"),
     ("True or false question", "Adversarial: or false"),
+
+    # ============================================================
+    # ADVERSARIAL SAFE - long text with multiple SQL keywords (must NOT BLOCK)
+    # ============================================================
+    ("Please select items from the drop-down list and update or delete entries as needed", "Adversarial: multi-keyword prose"),
+    ("The union of European countries decided to select representatives from member states and drop old policies", "Adversarial: long multi-keyword"),
+    ("We need to update the configuration, delete temporary files, and create a new backup from the database table", "Adversarial: sysadmin prose"),
+    ("Having selected the items from the list we need to order them by date and group the results", "Adversarial: having select order group"),
 ]
 
 print("=" * 120)
