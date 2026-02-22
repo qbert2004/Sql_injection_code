@@ -187,6 +187,16 @@ class InputNormalizer:
         '\u17b4'   # khmer vowel inherent aq
         '\u17b5'   # khmer vowel inherent aa
         '\u180e'   # mongolian vowel separator
+        # Bidirectional override / isolate characters (Fix E — bypass via RTL/LTR)
+        '\u202a'   # left-to-right embedding
+        '\u202b'   # right-to-left embedding
+        '\u202c'   # pop directional formatting
+        '\u202d'   # left-to-right override  ← primary bypass vector
+        '\u202e'   # right-to-left override  ← primary bypass vector
+        '\u2066'   # left-to-right isolate
+        '\u2067'   # right-to-left isolate
+        '\u2068'   # first strong isolate
+        '\u2069'   # pop directional isolate
         ']+'
     )
 
@@ -315,11 +325,19 @@ class InputNormalizer:
             text = decoded
             metadata['transformations'].append(f'url_decode_depth_{depth + 1}')
 
-        # 8. HTML entity decode
-        html_decoded = html.unescape(text)
-        if html_decoded != text:
+        # 8. HTML entity decode — loop until stable to handle double-encoded entities
+        # e.g. &#x26;#x27; → &#x27; (pass 1) → ' (pass 2). Cap at 4 iterations. (Fix D)
+        _html_decode_count = 0
+        for _html_depth in range(4):
+            html_decoded = html.unescape(text)
+            if html_decoded == text:
+                break
+            text = html_decoded
+            _html_decode_count += 1
+        if _html_decode_count > 0:
             metadata['transformations'].append('html_entity_decode')
-        text = html_decoded
+            if _html_decode_count > 1:
+                metadata['transformations'].append(f'html_entity_double_decode_{_html_decode_count}x')
 
         # 9. Null byte stripping
         if '\x00' in text:
@@ -351,9 +369,23 @@ class InputNormalizer:
             'concat', 'char', 'ascii', 'substring', 'between',
             'values', 'into', 'like', 'null', 'grant', 'revoke',
             'shutdown', 'schema', 'database', 'version',
+            # Dialect keywords needed for fragment reassembly (Fix A)
+            'pragma', 'bulk', 'load', 'reconfigure', 'openrowset', 'openquery',
+            # Intermediate 3-4 fragment merge steps (Fix 1)
+            # Allows multi-pass pair-merging of 3-4 fragment keyword splits.
+            # e.g. SE/**/L/**/ECT: pass1 se+l='sel'(in set)→ SEL ECT,
+            #                      pass2 sel+ect='select'(in set)→ SELECT
+            'sel', 'se',          # SELECT: SE + L + ECT
+            'dro',                # DROP:   DR + O + P
+            'del',                # DELETE: DE + L + ETE
+            'ins',                # INSERT: IN + S + ERT
+            'un', 'uni', 'unio',  # UNION:  U  + N + I + ON
+            'tab',                # TABLE:  TA + B + LE
+            'fro',                # FROM:   FR + O + M
+            'int',                # INTO:   IN + T + O
         }
         had_comments = False
-        for _ in range(5):  # max 5 nesting levels
+        for _ in range(10):  # increased from 5 → 10 to handle 6-7 nesting levels (Fix B)
             current_text = text
 
             def _comment_replacer(m: re.Match, _src=current_text) -> str:
@@ -381,7 +413,50 @@ class InputNormalizer:
             metadata['transformations'].append('comment_strip')
             # Strip orphan comment markers left by nested comment evasion
             # (e.g. UN/*/**/*/ION → UN/*/ION → strip /*/ → UNION)
-            text = re.sub(r'/\*|\*/', '', text)
+            # Fix 2: Also strip word-adjacent /* debris from deep-nested patterns.
+            # e.g. SE/*/*/*/*/LECT → loop leaves se**/lect → strip */ → se*lect
+            # The (?<=\w)[/*]+(?=\w) removes stray * and / chars between word chars.
+            # SELECT * FROM is safe: space before * means lookbehind fails (space not \w).
+            text = re.sub(r'/\*|\*/|(?<=\w)[/*]+(?=\w)', '', text)
+
+            # Fix A: Reassemble multi-fragment keyword splits produced by successive
+            # comment removals. After the loop, "UN/**/I/**/ON" may remain as
+            # "UN I ON" because each 2-fragment merge check failed (UNI, ION not keywords).
+            # Scan for space-separated token pairs whose concatenation IS a SQL keyword
+            # and collapse them. Loop until stable (handles 4+ fragment chains).
+            #
+            # Pre-collapse multiple spaces to single space so that space-padded
+            # comments like "UN /**/ ION" → "UN  ION" → "UN ION" before merging.
+            # The \b(\w+) (\w+)\b pattern only matches a single space between words.
+            text = re.sub(r' {2,}', ' ', text)
+            _kw_merge_re = re.compile(r'\b(\w+) (\w+)\b')
+            for _frag_pass in range(8):
+                _prev_text = text
+                def _fragment_joiner(m: re.Match, _kws=_sql_keywords_for_merge) -> str:
+                    merged = (m.group(1) + m.group(2)).lower()
+                    return (m.group(1) + m.group(2)) if merged in _kws else m.group(0)
+                text = _kw_merge_re.sub(_fragment_joiner, text)
+                if text == _prev_text:
+                    break
+
+            # Fix 1b: Handle "consumed fragment" residuals that pair-merger can't reach
+            # because a preceding word "consumed" one member of the pair.
+            # e.g. after merging DROP, the pair "tab le" is adjacent but DROP already
+            # consumed "tab"'s left neighbour in the non-overlapping scan.
+            _leftover_pairs = [
+                (r'\btab le\b', 'table'),   # TA/**/B/**/LE residual
+                (r'\bfro m\b', 'from'),     # FR/**/O/**/M residual
+                (r'\bint o\b', 'into'),     # IN/**/T/**/O residual (post-insert)
+            ]
+            for _lp_pat, _lp_rep in _leftover_pairs:
+                text = re.sub(_lp_pat, _lp_rep, text, flags=re.I)
+            # One final pass after targeted fixes to catch any newly created mergeable pairs
+            for _frag_pass2 in range(4):
+                _prev2 = text
+                text = _kw_merge_re.sub(_fragment_joiner, text)
+                if text == _prev2:
+                    break
+
         text_no_comments = text
 
         # 13. Whitespace collapse
@@ -495,7 +570,10 @@ class SQLSemanticAnalyzer:
     HIGH_RISK_KEYWORDS = [
         'select', 'union', 'insert', 'update', 'delete', 'drop',
         'truncate', 'exec', 'execute', 'xp_', 'sp_',
-        'shutdown', 'create', 'alter', 'grant', 'revoke'
+        'shutdown', 'create', 'alter', 'grant', 'revoke',
+        # Dialect keywords for SQLite, MSSQL, MySQL, PostgreSQL (Fix F)
+        'pragma', 'bulk', 'reconfigure', 'openrowset', 'openquery',
+        'lo_export', 'dblink',
     ]
 
     # Medium-risk keywords (logic manipulation / query structure)
@@ -701,6 +779,32 @@ class SQLSemanticAnalyzer:
             breakdown['injection_patterns'].append("tautology-numeric")
             evidence.append("Numeric tautology in SQL context")
 
+        # Pattern: Numeric comparison tautology — extended operators (Fix C)
+        # Matches: 2>1, 0<1, 3!=2, 3<>2, 2>=1, 0<=1 preceded by SQL context anchor.
+        # Anchor excludes prose: "Version 2>1 is newer" won't match (no OR/AND/'/; before it).
+        if re.search(
+            r"(?:'|;|\b(?:or|and|where|having)\b)\s*-?\d+\s*(?:!=|<>|>=|<=|>|<)\s*-?\d+",
+            text_clean, re.I
+        ):
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("tautology-numeric-comparison")
+            evidence.append("Numeric comparison tautology (!=, <>, >, <, >=, <=) in SQL context")
+
+        # Pattern: HAVING clause tautology — HAVING 1>0, HAVING COUNT(*)>0 (Fix C)
+        if re.search(
+            r"\bhaving\b.{0,30}(?:\d+\s*(?:>|<|>=|<=|!=|<>)\s*\d+|count\s*\()",
+            text_clean, re.I
+        ):
+            score += 3
+            structural_validity = True
+            if attack_type == AttackType.NONE:
+                attack_type = AttackType.BOOLEAN_BASED
+            breakdown['injection_patterns'].append("having-tautology")
+            evidence.append("HAVING clause with numeric/aggregate tautology")
+
         # Pattern: String tautology with OR/AND context
         if re.search(r"(or|and)\s+'(\w+)'\s*=\s*'\2'", text_clean, re.I):
             score += 3
@@ -762,6 +866,13 @@ class SQLSemanticAnalyzer:
                 _gap_text == ''
                 or re.match(r'^(all\s*)?$', _gap_text, re.I)
                 or re.search(r'[0-9()*,]', _gap_text)
+                # Fix G: short gap (≤3 words) + injection context (quote/comment) = attack not prose.
+                # "' UNION then SELECT 1--" has quote → gap_is_sql=True.
+                # "The EU (European Union) chose to select..." has no quote/comment → stays prose.
+                or (len(_gap_text.split()) <= 3 and (
+                    "'" in text_clean or '"' in text_clean
+                    or re.search(r'(--|#|/\*)', text_clean)
+                ))
             )
             _is_prose = len(text_clean) > 40 and not _gap_is_sql
             if not _is_prose:
@@ -777,21 +888,41 @@ class SQLSemanticAnalyzer:
             breakdown['injection_patterns'].append("union-select-obfuscated")
             evidence.append("Obfuscated UNION SELECT detected")
 
-        # Pattern: Stacked queries ('; SQL_KEYWORD)
-        stacked_match = re.search(r"['\w]\s*;\s*(select|insert|update|delete|drop|truncate|"
-                                  r"create|alter|exec|shutdown|waitfor|copy)", text_clean, re.I)
+        # Pattern: Stacked queries ('; SQL_KEYWORD) — includes dialect keywords (Fix F)
+        stacked_match = re.search(
+            r"['\w]\s*;\s*(select|insert|update|delete|drop|truncate|"
+            r"create|alter|exec|shutdown|waitfor|copy|"
+            r"pragma|bulk|reconfigure|openrowset|openquery|grant|revoke|"
+            r"load\s+data|load\s+local|lo_export|dblink|sp_addlinkedserver)",
+            text_clean, re.I
+        )
         if stacked_match:
             score += 3
             structural_validity = True
-            stacked_kw = stacked_match.group(1).lower()
-            if stacked_kw in ('drop', 'delete', 'truncate', 'alter', 'shutdown'):
+            stacked_kw = stacked_match.group(1).lower().split()[0]  # "load data" → "load"
+            if stacked_kw in ('drop', 'delete', 'truncate', 'alter', 'shutdown',
+                              'reconfigure', 'bulk', 'grant', 'revoke'):
                 attack_type = AttackType.STACKED_QUERY
-            elif stacked_kw in ('exec',):
+            elif stacked_kw in ('exec', 'openrowset', 'openquery',
+                                'sp_addlinkedserver', 'lo_export', 'dblink', 'load'):
                 attack_type = AttackType.OS_COMMAND
             elif attack_type == AttackType.NONE:
                 attack_type = AttackType.STACKED_QUERY
             breakdown['injection_patterns'].append("stacked-query")
             evidence.append(f"Stacked query with {stacked_kw.upper()}")
+            # Fix 4: Dialect stacked keyword bonus.
+            # PRAGMA, RECONFIGURE, LOAD DATA etc. fail _keyword_in_sql_context
+            # (no SQL operator neighbours) so their keyword score is 0.
+            # Total semantic after stacked = 3.0, below tau_semantic_override=6.0.
+            # Adding +3 here brings total to 6.0 → semantic override fires → BLOCK.
+            # FP guard: only fires when stacked regex already matched (requires ['\w];keyword).
+            _dialect_high_danger = {
+                'pragma', 'reconfigure', 'bulk', 'load',
+                'lo_export', 'dblink', 'openrowset', 'openquery', 'sp_addlinkedserver',
+            }
+            if stacked_kw in _dialect_high_danger:
+                score += 3
+                evidence.append(f"Dialect stacked keyword {stacked_kw.upper()} — elevated risk")
 
         # Pattern: Quote followed by OR/AND + digit
         if re.search(r"'\s*(or|and)\s+\d", text_clean, re.I):
@@ -839,7 +970,12 @@ class SQLSemanticAnalyzer:
             evidence.append("Bracket-delimited tautology (MSSQL style)")
 
         # Pattern: Subquery comparison — (SELECT ...)=value (blind injection)
-        if re.search(r"\(\s*select\b[^)]*\)\s*[=<>!]", text_clean, re.I):
+        # Fix 5: Allow one level of nested parens inside the subquery so that
+        # aggregate functions like COUNT(*), MAX(id) are handled correctly.
+        # Old pattern [^)]* stopped at the first ')' inside COUNT(*),
+        # preventing the outer ')>' from being matched.
+        # New: (?:[^)(]|\([^)]*\))* = any non-paren char OR a balanced (...)pair.
+        if re.search(r"\(\s*select\b(?:[^)(]|\([^)]*\))*\)\s*[=<>!]", text_clean, re.I):
             score += 3
             structural_validity = True
             if attack_type == AttackType.NONE:
@@ -906,15 +1042,57 @@ class SQLSemanticAnalyzer:
         #
         # Exception: comment truncation (--) with destructive keywords (DROP,
         # DELETE, TRUNCATE) IS an injection pattern, not documentation.
+        #
+        # Fix 6: Detect whether all apostrophes are possessive/contraction forms
+        # (O'Brien's, it's, don't) with no injection-context apostrophe present.
+        # Only when ALL apostrophes are possessive AND no other injection markers
+        # exist should we treat the text as non-injection.
+        # This is targeted: "O'Brien's SQL tutorial SELECT UNION" → purely
+        # possessive → _has_injection_apostrophe=False → score capped → SAFE.
+        # Regular attacks "'OR 1=1", "admin'--" → apostrophe is NOT purely
+        # possessive → _has_injection_apostrophe=True → normal detection.
+        def _is_purely_possessive(apos_pos: int, txt: str) -> bool:
+            """Return True if apostrophe at apos_pos is a possessive/contraction
+            (letter'letter or letter's) and not an injection break-in."""
+            before = txt[:apos_pos]
+            after = txt[apos_pos + 1:]
+            # Must have a letter immediately before
+            if not before or not before[-1].isalpha():
+                return False
+            # Must have a letter immediately after (it's, don't, O'Brien)
+            if not after or not after[0].isalpha():
+                return False
+            return True
+
+        _apostrophe_positions = [i for i, c in enumerate(text_clean) if c == "'"]
+        # _has_injection_apostrophe = True unless ALL apostrophes are possessive
+        if _apostrophe_positions:
+            _has_injection_apostrophe = not all(
+                _is_purely_possessive(pos, text_clean)
+                for pos in _apostrophe_positions
+            )
+        else:
+            _has_injection_apostrophe = False
+
         has_break_in = (
-            "'" in text_clean or '"' in text_clean
-            or re.search(r';\s*(select|drop|delete|insert|update|exec|truncate|shutdown)', text_clean, re.I)
+            _has_injection_apostrophe or '"' in text_clean
+            or re.search(
+                r';\s*(select|drop|delete|insert|update|exec|truncate|shutdown|'
+                r'pragma|bulk|reconfigure|openrowset|openquery|grant|revoke|load)',
+                text_clean, re.I
+            )  # extended with dialect keywords (Fix F)
             or len(breakdown['injection_patterns']) > 0
             or len(breakdown['sql_functions']) > 0
         )
-        # Destructive SQL keyword + comment truncation = attack, not documentation
+        # DML/DDL SQL keyword + comment truncation = attack, not documentation.
+        # Fix 3: Extended to include select/union/insert/update — these keywords
+        # with a trailing comment marker are injection probes (e.g. after comment-strip
+        # normalization of SE/**/L/**/ECT * FROM users-- → SELECT * FROM users--).
+        # FP guard: requires BOTH high_risk_keywords hit (context-checked) AND a comment
+        # marker. Prose with SQL words has no comment markers; CLI --flags have no SQL keywords.
         destructive_with_comment = (
-            any(kw in ('drop', 'delete', 'truncate', 'alter', 'shutdown', 'exec', 'execute')
+            any(kw in ('drop', 'delete', 'truncate', 'alter', 'shutdown', 'exec', 'execute',
+                       'select', 'union', 'insert', 'update')
                 for kw in breakdown['high_risk_keywords'])
             and len(breakdown['comment_patterns']) > 0
         )
@@ -929,6 +1107,25 @@ class SQLSemanticAnalyzer:
             # Pure SQL keywords without injection context → documentation
             score = min(score, 1.0)
             evidence.append("Standalone SQL statement (no injection break-in context)")
+
+        # Fix H: Long prose cap — if there are no structural SQL markers at all
+        # (no quotes, no semicolon, no comment markers, no injection patterns, no functions),
+        # cap the semantic score below tau_semantic_override (6.0) to prevent legitimate
+        # prose with incidental SQL keywords from triggering the semantic override rule.
+        # Only applies to long texts (>80 chars). Real attacks always have at least one marker.
+        # Fix 6 (continued): Reuse _has_injection_apostrophe computed above so
+        # that possessive apostrophes don't count as structural injection markers.
+        _has_structural_markers = bool(
+            _has_injection_apostrophe or '"' in text_clean
+            or re.search(r'(;|--|#|/\*)', text_clean)
+        )
+        if (len(text_clean) > 80
+                and not _has_structural_markers
+                and not breakdown['injection_patterns']
+                and not breakdown['sql_functions']
+                and score >= 5.0):
+            score = min(score, 4.9)
+            evidence.append("Long prose without SQL structural markers — score capped below semantic override")
 
         # ═══ STRUCTURAL VALIDITY CHECK ═══
         if score >= 2 and not structural_validity:
