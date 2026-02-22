@@ -1,16 +1,20 @@
 """
 SQL Injection Protection API Server (FastAPI)
 ==============================================
-Production-grade REST API with authentication, rate limiting, CORS, and OpenAPI docs.
+Production-grade REST API with AI agent, authentication, rate limiting, CORS, and OpenAPI docs.
 
 Endpoints:
-    POST /api/check         - Check single text for SQL injection
-    POST /api/validate      - Validate entire form (multi-field)
-    GET  /api/health        - Health check and model status
-    GET  /api/stats         - Incident statistics
-    GET  /api/incidents     - Query logged incidents (paginated)
-    POST /api/incident/{id}/feedback - Submit false positive/negative feedback
-    GET  /api/export        - SIEM export (JSON, CSV, CEF)
+    POST /api/check                   - Check single text for SQL injection (via AI agent)
+    POST /api/validate                - Validate entire form (multi-field)
+    GET  /api/health                  - Health check and model status
+    GET  /api/stats                   - Incident statistics
+    GET  /api/incidents               - Query logged incidents (paginated)
+    POST /api/incident/{id}/feedback  - Submit false positive/negative feedback
+    GET  /api/export                  - SIEM export (JSON, CSV, CEF)
+    GET  /api/agent/stats             - AI agent statistics (escalations, bans, learning)
+    GET  /api/agent/ip/{ip}           - IP reputation profile
+    GET  /api/agent/metrics           - Agent metrics summary
+    POST /api/agent/feedback          - Analyst feedback → online learning
 
 Usage:
     uvicorn api_server:app --host 0.0.0.0 --port 5000
@@ -18,10 +22,13 @@ Usage:
     curl -X POST http://localhost:5000/api/check \\
          -H "Content-Type: application/json" \\
          -d '{"text": "admin\\'--"}'
+    curl http://localhost:5000/api/agent/ip/192.168.1.100
+    curl http://localhost:5000/api/agent/metrics
 """
 
 import asyncio
 import ipaddress
+import os
 import time
 import traceback
 import uuid
@@ -36,6 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
+from agent import AgentConfig, AgentStore, SQLiAgent, agent_cleanup_loop
 from config import get_config
 from incident_logger import IncidentLogger
 from logger import get_logger, setup_logging
@@ -48,7 +56,7 @@ setup_logging(level=cfg.logging.level, format=cfg.logging.format)
 log = get_logger("api_server")
 
 # ═══ Constants ═══
-VERSION = "3.1.0"
+VERSION = "3.3.0"
 INFERENCE_TIMEOUT_SECONDS = 10  # Max time for a single detection call
 MAX_FIELDS = 50                 # Max fields per /api/validate request
 
@@ -57,6 +65,7 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sqli-inference
 
 # ═══ Global State ═══
 detector: SQLInjectionEnsemble | None = None
+agent: SQLiAgent | None = None
 logger: IncidentLogger | None = None
 
 # Rate limiting (sliding window with deque for O(1) append/popleft)
@@ -70,10 +79,25 @@ _rate_limit_last_cleanup: float = 0.0
 async def lifespan(app: FastAPI):
     """Application lifespan: initialize on startup, cleanup on shutdown."""
     # ── Startup ──
-    global detector, logger
+    global detector, agent, logger
     log.info("server_starting", port=cfg.api.port)
 
     detector = SQLInjectionEnsemble()
+
+    # AgentStore: SQLite persistence for IP bans + reputation across restarts
+    agent_db_path = os.environ.get("AGENT_DB_PATH", "agent_state.db")
+    store = AgentStore(db_path=agent_db_path)
+    agent = SQLiAgent(detector, store=store)
+
+    # Restore persisted bans and reputation from previous run
+    loaded_profiles = store.load_into(agent)
+    if loaded_profiles:
+        log.info("agent_state_loaded", profiles=loaded_profiles, db=agent_db_path)
+        try:
+            metrics.agent_persistence_loads.inc()
+        except Exception:
+            pass
+
     logger = IncidentLogger(db_path=cfg.incidents.db_path)
 
     if not cfg.api.api_key:
@@ -96,10 +120,23 @@ async def lifespan(app: FastAPI):
              cnn=detector.cnn_loaded,
              db=cfg.incidents.db_path)
 
+    # Start agent memory cleanup background task (every 5 minutes)
+    cleanup_task = asyncio.create_task(agent_cleanup_loop(agent, interval_seconds=300))
+
     yield  # ── App is running ──
 
     # ── Shutdown ──
+    cleanup_task.cancel()
     log.info("server_shutting_down")
+
+    # Final persistence flush before shutdown (save all active bans + reputation)
+    if agent is not None and agent.store is not None:
+        try:
+            saved = agent.store.flush(agent, min_attacks=agent.config.persist_min_attacks)
+            log.info("agent_state_flushed_on_shutdown", profiles_saved=saved)
+        except Exception as e:
+            log.error("agent_state_flush_failed", error=str(e))
+
     _executor.shutdown(wait=True, cancel_futures=False)
     log.info("server_stopped")
 
@@ -229,20 +266,26 @@ def _sanitize_log_value(value: str, max_len: int = 200) -> str:
 
 
 async def _run_detection(text: str, **kwargs) -> dict[str, Any]:
-    """Run detector.detect() in thread pool with timeout to avoid blocking event loop."""
+    """Run agent.evaluate() (or detector.detect() fallback) in thread pool with timeout."""
     loop = asyncio.get_event_loop()
     start = time.time()
     try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(_executor, lambda: detector.detect(text, **kwargs)),
-            timeout=INFERENCE_TIMEOUT_SECONDS,
-        )
+        if agent is not None:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(_executor, lambda: agent.evaluate(text, **kwargs)),
+                timeout=INFERENCE_TIMEOUT_SECONDS,
+            )
+        else:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(_executor, lambda: detector.detect(text, **kwargs)),
+                timeout=INFERENCE_TIMEOUT_SECONDS,
+            )
         # Record inference latency
         metrics.inference_duration.observe(time.time() - start)
 
-        # Record detection result
-        decision = result.get("decision", "UNKNOWN")
-        action = result.get("action", "UNKNOWN")
+        # Use agent decision if available, fall back to base detector decision
+        decision = result.get("agent_decision") or result.get("decision", "UNKNOWN")
+        action = result.get("agent_action") or result.get("action", "UNKNOWN")
         attack_type = result.get("attack_type", "NONE")
         metrics.detections_total.labels(decision=decision, action=action, attack_type=attack_type).inc()
         metrics.severity_total.labels(severity=result.get("severity", "INFO")).inc()
@@ -378,6 +421,21 @@ class CheckResponse(BaseModel):
     incident_id: int | None = None
     explanation: dict | None = None
     siem_fields: dict | None = None
+    # Agent fields (None when agent is disabled or no IP context)
+    agent_decision: str | None = None
+    agent_action: str | None = None
+    agent_reason: str | None = None
+    contributing_factors: dict | None = None   # structured explainability object
+    escalated: bool | None = None
+    adaptive_threshold_used: bool | None = None
+    ip_profile: dict | None = None
+    session_context: dict | None = None
+
+
+class AgentFeedbackRequest(BaseModel):
+    original_text: str = Field(..., description="The text that was incorrectly classified")
+    is_false_positive: bool = Field(..., description="True if detection was a false positive")
+    matched_pattern: str | None = Field(None, description="Signature pattern to suppress")
 
 
 # ═══ Endpoints ═══
@@ -448,11 +506,15 @@ async def check_single(req: CheckRequest, request: Request):
             },
         )
 
+    # Use agent decision if available, fall back to detector decision
+    final_decision = result.get("agent_decision") or result.get("decision", "SAFE")
+    final_action = result.get("agent_action") or result.get("action", "ALLOW")
+
     response = CheckResponse(
         input=req.text,
-        decision=result["decision"],
-        action=result["action"],
-        blocked=result["action"] in ("BLOCK", "ALERT"),
+        decision=final_decision,
+        action=final_action,
+        blocked=final_action in ("BLOCK", "ALERT"),
         confidence=result["confidence_level"],
         severity=result.get("severity", "INFO"),
         attack_type=result.get("attack_type", "NONE"),
@@ -468,6 +530,15 @@ async def check_single(req: CheckRequest, request: Request):
         incident_id=incident_id,
         explanation=result.get("explanation"),
         siem_fields=result.get("siem_fields"),
+        # Agent fields
+        agent_decision=result.get("agent_decision"),
+        agent_action=result.get("agent_action"),
+        agent_reason=result.get("agent_reason"),
+        contributing_factors=result.get("contributing_factors"),
+        escalated=result.get("escalated"),
+        adaptive_threshold_used=result.get("adaptive_threshold_used"),
+        ip_profile=result.get("ip_profile"),
+        session_context=result.get("session_context"),
     )
 
     log.info("api_check",
@@ -642,6 +713,81 @@ async def export_incidents(
         media_type=content_types.get(format, "application/json"),
         headers={"Content-Disposition": f"attachment; filename=incidents.{format}"},
     )
+
+
+@app.get("/api/agent/stats", tags=["AI Agent"],
+         dependencies=[Depends(check_api_key)])
+async def get_agent_stats():
+    """Get AI agent operational statistics (escalations, bans, adaptive triggers, learning)."""
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    return agent.get_stats()
+
+
+@app.get("/api/agent/ip/{ip_address}", tags=["AI Agent"],
+         dependencies=[Depends(check_api_key)])
+async def get_ip_reputation(ip_address: str):
+    """Get reputation profile for a specific IP address."""
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    try:
+        import ipaddress as _ipmod
+        _ipmod.ip_address(ip_address)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid IP address format")
+    return agent.get_ip_report(ip_address)
+
+
+@app.get("/api/agent/metrics", tags=["AI Agent"],
+         dependencies=[Depends(check_api_key)])
+async def get_agent_metrics():
+    """Get agent metrics: escalations, auto_bans, patterns_learned, memory usage."""
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+    stats = agent.get_stats()
+    return {
+        "escalations_total": stats["escalations"],
+        "auto_bans_total": stats["auto_bans"],
+        "ban_blocks_total": stats["ban_blocks"],
+        "adaptive_threshold_triggers": stats["adaptive_threshold_triggers"],
+        "signature_escalations": stats["signature_escalations"],
+        "patterns_learned": stats["online_learning"]["patterns_learned"],
+        "false_positives_corrected": stats["online_learning"]["false_positives_corrected"],
+        "sgd_fitted": stats["online_learning"]["sgd_fitted"],
+        "tracked_ips": stats["memory"]["tracked_ips"],
+        "tracked_sessions": stats["memory"]["tracked_sessions"],
+    }
+
+
+@app.post("/api/agent/feedback", tags=["AI Agent"],
+          dependencies=[Depends(check_api_key)])
+async def submit_agent_feedback(req: AgentFeedbackRequest):
+    """
+    Submit analyst feedback for active learning.
+    Marks a previously blocked text as false positive → agent suppresses that pattern.
+    """
+    if not agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    if req.is_false_positive:
+        agent.learn_false_positive(
+            text=req.original_text,
+            matched_pattern=req.matched_pattern,
+        )
+        log.info("agent_feedback_fp",
+                 text_preview=_sanitize_log_value(req.original_text, 60),
+                 pattern=req.matched_pattern)
+        return {
+            "status": "ok",
+            "action": "false_positive_learned",
+            "message": "Pattern weight suppressed. Thank you for the feedback.",
+        }
+    else:
+        return {
+            "status": "ok",
+            "action": "confirmed_positive",
+            "message": "Confirmed true positive recorded.",
+        }
 
 
 @app.get("/metrics", tags=["Monitoring"])
