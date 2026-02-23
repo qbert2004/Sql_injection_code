@@ -1,6 +1,6 @@
 # SQL Injection Protection System — Полная документация
 
-> Версия системы: 3.3.0 (production-ready)
+> Версия системы: 3.4.0 (production-ready)
 > Дата: 2026-02-23
 
 ---
@@ -1499,26 +1499,13 @@ except ValueError:
 
 ### 11.1 Критичные улучшения (impact: высокий)
 
-#### A. Автоматическое сохранение SGD-модели при shutdown
+#### ✅ A. Автоматическое сохранение SGD-модели при shutdown *(реализовано в v3.4.0)*
 
-**Проблема:** Веса SGDClassifier и выученные сигнатуры теряются при перезапуске. Реализация `AgentStore.save_sgd_model()` есть, но вызов не интегрирован в lifespan.
+**Реализовано:** `AgentStore.flush(agent, save_sgd=True)` автоматически сохраняет обученный `SGDClassifier` на диск через `joblib`. При следующем запуске `store.load_into(agent, load_sgd=True)` восстанавливает модель без переобучения.
 
-**Что сделать:**
-```python
-# В lifespan shutdown (api_server.py):
-if agent.online_learner._is_fitted:
-    agent.store.save_sgd_model(
-        agent.online_learner._clf,
-        agent.online_learner._vectorizer,
-        model_path="sgd_online_model.pkl"
-    )
+**Конфигурация:** путь файла задаётся через `AgentConfig.sgd_model_path` (по умолчанию `"agent_sgd.joblib"`).
 
-# При старте:
-result = agent.store.load_sgd_model("sgd_online_model.pkl")
-if result:
-    agent.online_learner._clf, agent.online_learner._vectorizer = result
-    agent.online_learner._is_fitted = True
-```
+**Протестировано:** `TestSGDPersistence` (3 теста): сохранение, восстановление, graceful degradation при отсутствии файла.
 
 **Эффект:** Накопленный online learning не теряется при деплое.
 
@@ -1543,26 +1530,22 @@ class RedisIPMemory:
 
 ---
 
-#### C. LRU eviction policy для `max_tracked_ips`
+#### ✅ C. LRU eviction policy для `max_tracked_ips` *(реализовано в v3.4.0)*
 
-**Проблема:** При переполнении `_profiles` dict (10000+ IP) новые профили просто не добавляются (нет лимита, только в документации). В реальности dict растёт неограниченно до OOM.
+**Реализовано:** `IPMemory.get_profile()` вызывает `_evict_lru()` при достижении лимита. Метод удаляет LRU (наименее недавно виденные) не-забаненные IP до `80%` от `max_tracked_ips` (гистерезис). Забаненные IP **никогда не вытесняются** — бан не может быть снят молчаливо.
 
-**Что сделать:** Заменить `dict` на `collections.OrderedDict` + вытеснение LRU при превышении `max_tracked_ips`:
-```python
-from collections import OrderedDict
-
-class IPMemory:
-    def get_profile(self, ip):
-        if ip in self._profiles:
-            self._profiles.move_to_end(ip)  # LRU update
-            return self._profiles[ip]
-        if len(self._profiles) >= self._max_ips:
-            # Evict least recently used non-banned IP
-            self._profiles.popitem(last=False)
-        ...
+```
+get_profile(new_ip)
+  └── if len(_profiles) >= max_tracked_ips:
+        _evict_lru()   → удаляет до target = 0.80 * max_tracked_ips старых IP
+        (banned IPs пропускаются при сортировке)
 ```
 
-**Эффект:** Предсказуемое потребление памяти в продакшне.
+**Метрика:** `stats["memory"]["lru_evictions"]` — суммарное число вытесненных IP. Видна в `/api/agent/stats`.
+
+**Протестировано:** `TestLRUEviction` (5 тестов): граничный предел, сохранение банов, порядок вытеснения, счётчик, batch-размер.
+
+**Эффект:** Предсказуемое потребление памяти в продакшне (O(max_tracked_ips) вместо O(∞)).
 
 ---
 
@@ -1656,7 +1639,7 @@ async def live_feed(websocket: WebSocket):
 
 #### H. Полное покрытие тестами API-слоя
 
-**Что есть:** 65 тестов для agent.py (`test_agent.py`), тесты детектора (`bypass_r4.py`).
+**Что есть:** 73 теста для agent.py (`test_agent.py`), тесты детектора (`bypass_r4.py`).
 
 **Чего нет:** pytest-тесты для api_server.py с mock-инжекцией detector/agent.
 
@@ -1736,9 +1719,9 @@ deny 5.6.7.8;
 
 | # | Улучшение | Сложность | Эффект | Приоритет |
 |---|-----------|-----------|--------|-----------|
-| A | Автосохранение SGD модели | Малая (30 строк) | Средний | 🔴 Высокий |
+| ✅ A | Автосохранение SGD модели | Малая (30 строк) | Средний | Готово (v3.4.0) |
 | B | Redis backend для multi-worker | Высокая | Критический | 🔴 Высокий |
-| C | LRU eviction для max_tracked_ips | Малая (20 строк) | Средний | 🟡 Средний |
+| ✅ C | LRU eviction для max_tracked_ips | Малая (20 строк) | Средний | Готово (v3.4.0) |
 | D | Hot-reload конфигурации через API | Малая (40 строк) | Высокий | 🟡 Средний |
 | E | Whitelist IP/CIDR | Малая (15 строк) | Средний | 🟡 Средний |
 | F | Переобучение RF/CNN по расписанию | Высокая | Высокий | 🟡 Средний |
@@ -1748,6 +1731,219 @@ deny 5.6.7.8;
 | J | Экспорт банлиста nginx/iptables | Малая (20 строк) | Низкий | 🟢 Низкий |
 | K | VirusTotal/Shodan интеграция | Средняя | Низкий | 🟢 Низкий |
 
-**Минимальный набор для 9/10:** A + C + D + E + I (все малая/средняя сложность, высокий эффект).
+**Минимальный набор для 9/10:** ~~A~~ ✅ + ~~C~~ ✅ + D + E + I (все малая/средняя сложность, высокий эффект).
 
 **Для 10/10 (enterprise-grade):** + B (Redis) + F (periodic retraining) + H (API tests).
+
+---
+
+## 12. Руководство по production-деплою
+
+Этот раздел содержит ответы на вопросы, которые обязательно возникнут при развёртывании системы в реальном продакшне.
+
+---
+
+### 12.1 Количество воркеров и IP-память
+
+**Критическое ограничение:** IP-память (`IPMemory`) и сессионная память (`SessionMemory`) хранятся **в RAM каждого воркера** независимо. При `--workers 4` у каждого воркера своя копия. IP с 3 атаками, распределёнными по воркерам, не получит автобан.
+
+**Рекомендуемые варианты:**
+
+| Сценарий | Настройка | Компромисс |
+|----------|-----------|------------|
+| Разработка / малая нагрузка | `--workers 1` | Нет проблемы. Безопасно. |
+| Средняя нагрузка | nginx `ip_hash` + `--workers N` | Один IP всегда попадает в один воркер. Требует nginx перед uvicorn. |
+| Высокая нагрузка (продакшн) | Redis backend (Roadmap B) | Полноценное решение. Требует Redis. |
+
+**Запуск в single-worker режиме:**
+
+```bash
+# Безопасный старт (по умолчанию для этой архитектуры):
+uvicorn api_server:app --host 0.0.0.0 --port 5000 --workers 1
+
+# С персистентностью:
+uvicorn api_server:app --workers 1 --log-level info
+```
+
+**Конфигурация nginx с ip_hash (workaround для multi-worker):**
+
+```nginx
+upstream sqli_backend {
+    ip_hash;               # ← один IP всегда идёт в один воркер
+    server 127.0.0.1:5001;
+    server 127.0.0.1:5002;
+    server 127.0.0.1:5003;
+    server 127.0.0.1:5004;
+}
+
+server {
+    listen 80;
+    location /api/ {
+        proxy_pass http://sqli_backend;
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+}
+```
+
+> ⚠️ `ip_hash` не работает при наличии CDN/Cloudflare — все запросы идут с одного IP (CDN-ноды). В этом случае нужен заголовок `CF-Connecting-IP` или Redis backend.
+
+---
+
+### 12.2 Circuit breaker — защита от каскадного отказа
+
+**Проблема:** Если SQLi Protection API недоступен (перезапуск, OOM, высокая нагрузка), вызывающее приложение должно принять решение: пропустить запрос (fail-open) или заблокировать (fail-closed).
+
+**Политика по умолчанию: fail-open**. Большинство production-систем выбирают fail-open: временный сбой защитной системы не должен останавливать работу приложения.
+
+| Политика | Поведение при недоступности API | Когда применять |
+|----------|--------------------------------|-----------------|
+| **fail-open** | Запрос пропускается, приложение работает | Общий случай: опыт пользователя важнее, падение редкое |
+| **fail-closed** | Запрос блокируется с 503 | Финансовые операции, sensitive data, регуляторные требования |
+
+**Реализация circuit breaker на стороне вызывающего приложения:**
+
+```python
+# Установка: pip install circuitbreaker
+from circuitbreaker import circuit
+import httpx
+
+@circuit(
+    failure_threshold=5,    # 5 неудач → открыть circuit
+    recovery_timeout=30,    # через 30s попробовать снова
+    expected_exception=httpx.HTTPError,
+)
+async def check_sqli(text: str, ip: str) -> dict:
+    async with httpx.AsyncClient(timeout=1.0) as client:
+        resp = await client.post(
+            "http://localhost:5000/api/check",
+            json={"text": text},
+            headers={"X-Forwarded-For": ip},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+# В middleware:
+async def protect_request(text: str, ip: str) -> bool:
+    """Returns True if request should be blocked."""
+    try:
+        result = await check_sqli(text, ip)
+        return result.get("agent_action") == "BLOCK"
+    except Exception:
+        # Circuit open или timeout → fail-open: пропустить запрос
+        return False  # ← изменить на True для fail-closed
+```
+
+**Рекомендуемые таймауты:**
+
+| Параметр | Значение | Обоснование |
+|----------|---------|-------------|
+| `httpx.AsyncClient(timeout=...)` | `1.0` сек | p99 латентность системы ≈ 55ms; 1s = 18× запас |
+| `failure_threshold` | `5` | 5 таймаутов подряд → circuit open |
+| `recovery_timeout` | `30` сек | Время на перезапуск uvicorn/systemd |
+
+---
+
+### 12.3 Бюджет латентности
+
+Полный путь запроса с учётом всех компонентов:
+
+```
+Клиент → nginx (0.1ms) → uvicorn (0.2ms)
+  → api_server.py rate limit check (0.1ms)
+  → agent.evaluate():
+      ban check (0.05ms)
+      predictive defense (0.05ms)
+      signature check (0.5ms)
+      _get_adapted_detector (0.1ms)
+      detector.detect():
+          RF inference (3–8ms)       ← доминирует при hit
+          CNN inference (15–40ms)    ← доминирует при VDCNN
+          semantic analysis (0.5ms)
+      escalation rules (0.1ms)
+      memory update (0.2ms)
+  → JSON serialization (0.1ms)
+→ ответ клиенту
+
+Итого p50: ~20ms | p95: ~45ms | p99: ~55ms
+```
+
+> При `--workers 1` весь ThreadPoolExecutor на 4 потока. Параллельные запросы обслуживаются конкурентно. Узкое место — CNN (GPU не используется в текущей реализации; можно добавить `device="cuda"` в `CNNDetector`).
+
+---
+
+### 12.4 Детекция vs Предотвращение
+
+**Важно понимать:** эта система — **детектор, а не WAF**. Она классифицирует текст как атаку и возвращает решение `BLOCK` / `ALLOW` / `CHALLENGE`. Фактическое блокирование запроса — ответственность **вызывающего кода**.
+
+```
+[ваш API] ← BLOCK решение ← [SQLi Protector]
+     │
+     └── вы решаете: вернуть 400? залогировать? дропнуть?
+```
+
+Система **не заменяет**:
+- Параметризованные SQL-запросы (prepared statements) — единственная надёжная защита от SQL-инъекций
+- WAF (ModSecurity, AWS WAF) — работают на уровне HTTP до парсинга
+- ORM с эскейпингом — SQLAlchemy, Django ORM автоматически экранируют значения
+
+**Правильная многоуровневая архитектура:**
+
+```
+Запрос → nginx WAF (Layer 0) → SQLi Protector (Layer 1, обнаружение) → ORM (Layer 2, предотвращение)
+```
+
+---
+
+### 12.5 Ограничения, которые нужно знать до деплоя
+
+| Ограничение | Описание | Workaround |
+|-------------|----------|------------|
+| **Second-order injection** | Система не видит значения, которые были сохранены ранее и теперь используются в SQL | Проверять данные при извлечении из БД (отдельный вызов API) |
+| **Multi-worker** | IP-память несогласованна между воркерами | `--workers 1` или nginx `ip_hash` или Redis |
+| **No GPU** | CNN работает на CPU (~15–40ms вместо ~2ms на GPU) | `torch.device("cuda")` если GPU доступен |
+| **Vendor-specific** | `LPAD()`, `EXTRACTVALUE()`, `SYS.USER$` не все покрыты | Расширить сигнатуры в `OnlineLearning` |
+| **Нет AST-анализа** | Семантически корректный SQL (без хорошо известных паттернов) может пройти | Добавить `sqlglot` как Layer 1.5 |
+
+**Добавление sqlglot (Layer 1.5) — ~50 строк кода:**
+
+```python
+# pip install sqlglot
+import sqlglot
+
+def _check_sql_ast(text: str) -> dict:
+    """
+    Parse text as SQL and flag structurally suspicious constructs.
+    Returns {"suspicious": bool, "reason": str}.
+    """
+    try:
+        tree = sqlglot.parse_one(text, error_level=sqlglot.ErrorLevel.IGNORE)
+    except Exception:
+        return {"suspicious": False, "reason": ""}
+
+    # Flag known dangerous patterns in AST
+    for node in tree.walk():
+        if isinstance(node, sqlglot.exp.Subquery):
+            return {"suspicious": True, "reason": "Nested subquery in AST"}
+        if isinstance(node, sqlglot.exp.Union):
+            return {"suspicious": True, "reason": "UNION in AST"}
+        if isinstance(node, (sqlglot.exp.Drop, sqlglot.exp.Delete)):
+            return {"suspicious": True, "reason": f"{type(node).__name__} statement"}
+    return {"suspicious": False, "reason": ""}
+```
+
+Этот вызов можно добавить в `SQLiAgent.evaluate()` до детектора как быстрый pre-check.
+
+---
+
+### 12.6 Чеклист перед первым деплоем
+
+- [ ] Установить `API_KEY` в переменных окружения (`export API_KEY=<32-char-hex>`)
+- [ ] Убедиться, что `--workers 1` или настроен nginx `ip_hash`
+- [ ] Выбрать политику fail-open/fail-closed и зафиксировать её в коде
+- [ ] Установить таймаут на стороне клиента ≤ 1 секунда
+- [ ] Добавить circuit breaker (5 ошибок → 30s pause)
+- [ ] Настроить systemd / supervisor для автоперезапуска
+- [ ] Проверить доступность `/metrics` для Prometheus scrape
+- [ ] Запустить демо: `py -3 agent.py` — убедиться, что эскалация и автобан работают
+- [ ] Запустить регрессию: `py -3 bypass_r4.py` — 164/164 (100%)
+- [ ] Запустить тесты: `py -3 -m pytest test_agent.py` — 73/73 passed

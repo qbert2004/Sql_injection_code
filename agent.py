@@ -1,5 +1,5 @@
 """
-SQLi Protection AI Agent  (production-ready, v2.0)
+SQLi Protection AI Agent  (production-ready, v3.0)
 ===================================================
 Autonomous AI agent that wraps SQLInjectionEnsemble and adds:
   - IP memory (counters, sliding-window history, reputation scoring)
@@ -11,11 +11,15 @@ Autonomous AI agent that wraps SQLInjectionEnsemble and adds:
   - System coordination (WAF/SIEM webhooks, threat intel)
   - Decision explainability (string + structured contributing_factors)
 
-Production features (v2.0):
+Production features (v3.0 — added in v3.4.0 release):
   - threading.RLock in IPMemory and SessionMemory — no race conditions
   - SQLite persistence (AgentStore) — survives server restarts
   - Prometheus gauge updates via metrics module
   - Structured explanation object alongside human-readable string
+  - LRU eviction (Roadmap C): IPMemory evicts oldest non-banned IPs when
+    max_tracked_ips is reached — predictable memory usage (O(max_tracked_ips))
+  - SGD auto-save (Roadmap A): flush(save_sgd=True) persists the fitted
+    SGDClassifier; load_into(load_sgd=True) restores it on restart
 
 Design notes:
   - PredictiveDefense uses a LOCAL multiplier variable, never mutates AgentConfig
@@ -109,6 +113,7 @@ class AgentConfig:
     # ── Persistence ────────────────────────────────────────────
     persistence_flush_interval: int = 300  # flush to SQLite every N seconds
     persist_min_attacks: int = 1           # only persist IPs with >= N attacks (skip clean IPs)
+    sgd_model_path: str = "agent_sgd.joblib"  # path for SGD model persistence (Roadmap A)
 
 
 def _agent_config_from_env(base: AgentConfig | None = None) -> AgentConfig:
@@ -183,9 +188,12 @@ class AgentStore:
 
     # ── Load ──────────────────────────────────────────────────
 
-    def load_into(self, agent: "SQLiAgent") -> int:
+    def load_into(self, agent: "SQLiAgent", load_sgd: bool = True) -> int:
         """
         Load persisted IP profiles into agent IPMemory.
+        If load_sgd=True and a SGD model file exists at agent.config.sgd_model_path,
+        also restores the online learning layer without needing retraining
+        (Roadmap A — restore SGD on startup).
         Returns number of profiles loaded.
         Expired bans are automatically cleared during load.
         """
@@ -224,14 +232,29 @@ class AgentStore:
         except Exception as e:
             print(f"[AgentStore] WARNING: load_into failed: {e}")
 
+        # ── SGD model restore (Roadmap A) ─────────────────────
+        if load_sgd and hasattr(agent, "online_learner"):
+            ol = agent.online_learner
+            if ol._enabled:
+                model_path = getattr(agent.config, "sgd_model_path", "agent_sgd.joblib")
+                result = self.load_sgd_model(model_path)
+                if result is not None:
+                    clf, vectorizer = result
+                    with ol._lock:
+                        ol._clf = clf
+                        ol._vectorizer = vectorizer
+                        ol._is_fitted = True
+
         return loaded
 
     # ── Flush ─────────────────────────────────────────────────
 
-    def flush(self, agent: "SQLiAgent", min_attacks: int = 1) -> int:
+    def flush(self, agent: "SQLiAgent", min_attacks: int = 1, save_sgd: bool = True) -> int:
         """
         Persist all IP profiles from agent memory to SQLite.
         Only persists IPs with >= min_attacks (skips clean traffic).
+        If save_sgd=True and the online SGD layer is fitted, also saves it to disk
+        at agent.config.sgd_model_path (Roadmap A — auto-save on shutdown).
         Returns number of rows upserted.
         """
         saved = 0
@@ -287,6 +310,13 @@ class AgentStore:
         except Exception as e:
             print(f"[AgentStore] WARNING: flush failed: {e}")
 
+        # ── SGD model save (Roadmap A) ─────────────────────────
+        if save_sgd and hasattr(agent, "online_learner"):
+            ol = agent.online_learner
+            if ol._enabled and ol._is_fitted:
+                model_path = getattr(agent.config, "sgd_model_path", "agent_sgd.joblib")
+                self.save_sgd_model(ol._clf, ol._vectorizer, model_path)
+
         return saved
 
     # ── SGD model ─────────────────────────────────────────────
@@ -340,11 +370,19 @@ class IPProfile:
 
 class IPMemory:
     """
-    In-memory store of per-IP profiles with TTL-based cleanup.
+    In-memory store of per-IP profiles with TTL-based cleanup and LRU eviction.
 
     Thread safety: ALL public methods acquire self._lock (threading.RLock).
     The lock is reentrant so that nested calls from the same thread are safe.
+
+    LRU eviction (Roadmap C):
+      When the number of tracked IPs exceeds max_ips, the least-recently-seen
+      non-banned IPs are evicted to keep memory bounded.  Banned IPs are always
+      retained until their ban expires, so eviction never silently lifts a ban.
     """
+
+    # Evict down to this fraction of max_ips when the cap is hit (hysteresis)
+    _EVICT_TARGET_FRACTION = 0.80
 
     def __init__(self, ttl: float = 3600.0, max_ips: int = 10000) -> None:
         self._profiles: dict[str, IPProfile] = {}
@@ -358,8 +396,47 @@ class IPMemory:
         """Return existing profile or create a new one. Caller must hold self._lock."""
         # NOTE: intentionally no lock here — callers must hold _lock for consistency
         if ip not in self._profiles:
+            # LRU eviction: if at capacity, free space before inserting
+            if len(self._profiles) >= self._max_ips:
+                evicted = self._evict_lru()
+                # Surface eviction count via a shared counter (set by SQLiAgent)
+                _eviction_callback = getattr(self, "_eviction_callback", None)
+                if _eviction_callback is not None:
+                    _eviction_callback(evicted)
             self._profiles[ip] = IPProfile(ip=ip)
         return self._profiles[ip]
+
+    def _evict_lru(self) -> int:
+        """
+        Evict least-recently-seen non-banned IPs until we reach
+        _EVICT_TARGET_FRACTION * max_ips entries.
+
+        Banned IPs are NEVER evicted (eviction must not silently lift bans).
+        Returns the number of entries removed.
+
+        Caller must hold self._lock.
+        """
+        target = int(self._max_ips * self._EVICT_TARGET_FRACTION)
+        now = time.time()
+
+        # Collect eviction candidates: non-banned, sorted oldest last_seen first
+        candidates = sorted(
+            (
+                (ip, p.last_seen)
+                for ip, p in self._profiles.items()
+                if not (p.is_banned and (p.ban_until is None or p.ban_until > now))
+            ),
+            key=lambda x: x[1],   # ascending → oldest first
+        )
+
+        removed = 0
+        for ip, _ in candidates:
+            if len(self._profiles) <= target:
+                break
+            del self._profiles[ip]
+            removed += 1
+
+        return removed
 
     def update(
         self,
@@ -1004,6 +1081,11 @@ class SQLiAgent:
         # Agent-level statistics
         self._stats: dict[str, int] = defaultdict(int)
 
+        # Wire LRU eviction callback so SQLiAgent can count evictions
+        self.ip_memory._eviction_callback = lambda n: self._stats.__setitem__(
+            "lru_evictions", self._stats["lru_evictions"] + n
+        )
+
     # ═══════════════════════════════════════════════════════════
     #  Main entry point
     # ═══════════════════════════════════════════════════════════
@@ -1446,6 +1528,8 @@ class SQLiAgent:
                 "tracked_sessions": len(self.session_memory._sessions),
                 "active_bans": self.ip_memory.count_active_bans(),
                 "mean_reputation": round(self.ip_memory.mean_reputation(), 4),
+                "max_tracked_ips": self.ip_memory._max_ips,
+                "lru_evictions": self._stats["lru_evictions"],
             },
             "persistence": {
                 "store_configured": self.store is not None,
