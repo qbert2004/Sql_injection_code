@@ -1110,7 +1110,7 @@ class TestMaxTrackedIPs:
     def test_does_not_crash_above_max_ips(self):
         """
         With max_ips=5 and 10 unique IPs, agent must not crash.
-        (Overflow protection relies on cleanup_stale; agent does not enforce it per-request.)
+        LRU eviction now enforces the cap per-request.
         """
         cfg = AgentConfig(
             max_tracked_ips=5,
@@ -1125,6 +1125,206 @@ class TestMaxTrackedIPs:
                 agent.evaluate("test", source_ip=f"192.168.1.{i}")
             except Exception as e:
                 pytest.fail(f"Agent crashed with max_ips overflow: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+#  LRU Eviction (Roadmap C)
+# ─────────────────────────────────────────────────────────────
+
+class TestLRUEviction:
+    """Tests for IPMemory LRU eviction when max_ips is reached."""
+
+    def test_memory_stays_within_max_ips(self):
+        """After inserting N > max_ips unique IPs, profile count must not exceed max_ips."""
+        max_ips = 5
+        mem = IPMemory(ttl=3600, max_ips=max_ips)
+        with mem._lock:
+            for i in range(20):
+                mem.get_profile(f"10.0.0.{i}")
+        assert len(mem._profiles) <= max_ips, (
+            f"Expected ≤{max_ips} profiles, got {len(mem._profiles)}"
+        )
+
+    def test_banned_ips_not_evicted(self):
+        """Banned IPs must never be removed by LRU eviction."""
+        max_ips = 3
+        mem = IPMemory(ttl=3600, max_ips=max_ips)
+
+        # Plant one banned IP
+        banned_ip = "1.2.3.4"
+        mem.ban(banned_ip, 3600)
+
+        # Now flood with many non-banned IPs to trigger eviction
+        with mem._lock:
+            for i in range(20):
+                # Add extra time between each to make last_seen different
+                mem.get_profile(f"192.168.0.{i}").last_seen = time.time() - (20 - i)
+
+        # Banned IP must still be there
+        assert banned_ip in mem._profiles, (
+            "Banned IP was evicted — banned IPs must always be retained"
+        )
+
+    def test_oldest_non_banned_ip_evicted_first(self):
+        """LRU eviction removes the IP with the smallest last_seen timestamp."""
+        max_ips = 3
+        mem = IPMemory(ttl=3600, max_ips=max_ips)
+
+        # Insert 3 IPs with distinct last_seen timestamps
+        with mem._lock:
+            oldest = mem.get_profile("old")
+            oldest.last_seen = time.time() - 3000   # oldest
+            mid = mem.get_profile("mid")
+            mid.last_seen = time.time() - 2000
+            newest = mem.get_profile("new")
+            newest.last_seen = time.time() - 1000   # newest
+
+        assert len(mem._profiles) == 3  # at cap
+
+        # Insert one more → should evict "old"
+        with mem._lock:
+            mem.get_profile("extra")
+
+        assert "old" not in mem._profiles, "Oldest IP should have been evicted"
+        assert "new" in mem._profiles, "Newest IP should not have been evicted"
+
+    def test_eviction_counter_in_stats(self):
+        """SQLiAgent._stats['lru_evictions'] increments when eviction occurs."""
+        cfg = AgentConfig(
+            max_tracked_ips=3,
+            enable_adaptive_thresholds=False,
+            enable_predictive_defense=False,
+            enable_online_learning=False,
+        )
+        agent = _make_agent(_safe_detector(), config=cfg)
+
+        for i in range(10):
+            agent.evaluate("hello", source_ip=f"10.1.1.{i}")
+
+        stats = agent.get_stats()
+        assert stats["memory"]["lru_evictions"] > 0, (
+            "Expected lru_evictions > 0 after inserting 10 IPs into max_ips=3 memory"
+        )
+
+    def test_lru_evict_target_fraction(self):
+        """
+        _evict_lru() should evict down to _EVICT_TARGET_FRACTION*max_ips, not just 1 entry.
+        This verifies that eviction is done in a batch (hysteresis).
+        """
+        max_ips = 10
+        mem = IPMemory(ttl=3600, max_ips=max_ips)
+        target = int(max_ips * mem._EVICT_TARGET_FRACTION)
+
+        # Fill to max_ips with distinct last_seen
+        with mem._lock:
+            for i in range(max_ips):
+                p = mem.get_profile(f"192.0.0.{i}")
+                p.last_seen = time.time() - (max_ips - i) * 10
+
+        assert len(mem._profiles) == max_ips
+
+        # Trigger eviction manually
+        with mem._lock:
+            removed = mem._evict_lru()
+
+        assert removed > 0, "Should have removed at least one entry"
+        assert len(mem._profiles) <= target, (
+            f"After eviction, should have ≤{target} profiles (got {len(mem._profiles)})"
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+#  SGD persistence — auto-save / auto-restore (Roadmap A)
+# ─────────────────────────────────────────────────────────────
+
+class TestSGDPersistence:
+    """Tests for SGD model save/restore across simulated restarts."""
+
+    @pytest.fixture
+    def tmp_paths(self, tmp_path):
+        return {
+            "db": str(tmp_path / "agent_test.db"),
+            "sgd": str(tmp_path / "agent_sgd.joblib"),
+        }
+
+    @pytest.mark.skipif(not _SKLEARN_AVAILABLE, reason="sklearn not installed")
+    def test_sgd_saved_on_flush_when_fitted(self, tmp_paths):
+        """After the SGD is fitted, flush() should save the model file."""
+        cfg = AgentConfig(
+            sgd_model_path=tmp_paths["sgd"],
+            enable_online_learning=True,
+            incremental_fit_batch_size=2,  # fit after 2 examples
+        )
+        agent = _make_agent(_injection_detector(), config=cfg)
+        store = AgentStore(db_path=tmp_paths["db"])
+        agent.store = store
+
+        # Trigger 2 BLOCK detections → fills buffer → SGD fits
+        for _ in range(2):
+            agent.evaluate("' OR 1=1--", source_ip="5.5.5.5")
+
+        # Give online learner a chance to fit (buffer reached batch size)
+        # Force-fit if not fitted yet (some paths may not trigger learning)
+        if not agent.online_learner._is_fitted:
+            agent.online_learner._incremental_fit()
+
+        if not agent.online_learner._is_fitted:
+            pytest.skip("SGD did not fit (need more injections) — skip SGD persistence test")
+
+        store.flush(agent, save_sgd=True)
+        assert os.path.exists(tmp_paths["sgd"]), (
+            "SGD model file should exist after flush() with fitted SGD"
+        )
+
+    @pytest.mark.skipif(not _SKLEARN_AVAILABLE, reason="sklearn not installed")
+    def test_sgd_restored_on_load_into(self, tmp_paths):
+        """
+        After flush() saves the SGD, load_into() on a new agent should restore
+        it and mark _is_fitted=True without needing retraining.
+        """
+        cfg = AgentConfig(
+            sgd_model_path=tmp_paths["sgd"],
+            enable_online_learning=True,
+            incremental_fit_batch_size=2,
+        )
+
+        # Phase 1: train and save
+        agent = _make_agent(_injection_detector(), config=cfg)
+        store = AgentStore(db_path=tmp_paths["db"])
+        for _ in range(2):
+            agent.evaluate("' OR 1=1--", source_ip="5.5.5.5")
+        if not agent.online_learner._is_fitted:
+            agent.online_learner._incremental_fit()
+        if not agent.online_learner._is_fitted:
+            pytest.skip("SGD did not fit — skip SGD restore test")
+        store.flush(agent, save_sgd=True)
+
+        # Phase 2: simulate restart — new agent, same config
+        agent2 = _make_agent(_safe_detector(), config=cfg)
+        store2 = AgentStore(db_path=tmp_paths["db"])
+        store2.load_into(agent2, load_sgd=True)
+
+        assert agent2.online_learner._is_fitted, (
+            "SGD should be marked fitted after load_into() restores the model"
+        )
+
+    @pytest.mark.skipif(not _SKLEARN_AVAILABLE, reason="sklearn not installed")
+    def test_missing_sgd_file_does_not_crash(self, tmp_paths):
+        """If the SGD model file doesn't exist, load_into() should not crash."""
+        cfg = AgentConfig(
+            sgd_model_path=tmp_paths["sgd"],  # file does not exist yet
+            enable_online_learning=True,
+        )
+        agent = _make_agent(_safe_detector(), config=cfg)
+        store = AgentStore(db_path=tmp_paths["db"])
+
+        try:
+            store.load_into(agent, load_sgd=True)
+        except Exception as e:
+            pytest.fail(f"load_into() crashed when SGD file is missing: {e}")
+
+        # _is_fitted should remain False
+        assert not agent.online_learner._is_fitted
 
 
 if __name__ == "__main__":
