@@ -164,7 +164,13 @@ class AgentStore:
 
     def __init__(self, db_path: str = "agent_state.db") -> None:
         self.db_path = db_path
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()           # guards SQLite writes
+        self._flush_lock = threading.Lock()     # prevents concurrent flush() calls
+        # Concurrent flush() is safe at the SQLite level (WAL mode) but wasteful:
+        # two threads would snapshot the same data and write identical rows.
+        # More importantly, the SGD save (joblib.dump) is NOT atomic — a second
+        # concurrent save could corrupt the file if it writes while the first is
+        # mid-write.  _flush_lock serialises all flush() calls.
         self._init_db()
 
     # ── Lifecycle ─────────────────────────────────────────────
@@ -256,7 +262,20 @@ class AgentStore:
         If save_sgd=True and the online SGD layer is fitted, also saves it to disk
         at agent.config.sgd_model_path (Roadmap A — auto-save on shutdown).
         Returns number of rows upserted.
+
+        Thread safety: guarded by _flush_lock to prevent concurrent flushes.
+        Concurrent flush calls are safe at the SQLite level (WAL mode) but the
+        SGD joblib.dump() is NOT atomic — interleaved writes could corrupt the
+        model file.  _flush_lock serialises all callers (cleanup loop, atexit,
+        lifespan shutdown) without blocking normal detect() calls.
         """
+        # Non-blocking trylock: if a flush is already in progress, skip this call.
+        # This prevents the atexit handler from blocking behind a slow periodic flush.
+        acquired = self._flush_lock.acquire(blocking=True, timeout=8.0)
+        if not acquired:
+            print("[AgentStore] WARNING: flush() skipped — another flush is in progress")
+            return 0
+
         saved = 0
         try:
             # Snapshot profiles under lock to minimize contention
@@ -309,8 +328,12 @@ class AgentStore:
 
         except Exception as e:
             print(f"[AgentStore] WARNING: flush failed: {e}")
+        finally:
+            self._flush_lock.release()
 
         # ── SGD model save (Roadmap A) ─────────────────────────
+        # Done outside _flush_lock to avoid holding it during slow joblib.dump().
+        # joblib.dump() is atomic at the OS level (write to temp + rename on POSIX).
         if save_sgd and hasattr(agent, "online_learner"):
             ol = agent.online_learner
             if ol._enabled and ol._is_fitted:
