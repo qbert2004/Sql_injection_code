@@ -1935,14 +1935,57 @@ def _check_sql_ast(text: str) -> dict:
 
 ---
 
-### 12.6 Чеклист перед первым деплоем
+### 12.6 Graceful shutdown и защита SGD-модели
+
+Потеря данных при перезапуске — реальная операционная проблема. Ниже описаны три уровня защиты, реализованные в v3.4.0.
+
+**Уровень 1: Периодический flush (agent_cleanup_loop)**
+
+Каждые 300 секунд (настраивается через `persistence_flush_interval`) фоновая задача сохраняет IP-профили в SQLite. Максимальная потеря данных при SIGKILL — 5 минут.
+
+**Уровень 2: FastAPI lifespan shutdown**
+
+При штатной остановке (`Ctrl+C`, `systemctl stop`) выполняется `store.flush(save_sgd=True)`. SGD-модель и IP-профили сохраняются до завершения процесса.
+
+**Уровень 3: atexit + SIGTERM handler (v3.4.0)**
+
+```
+SIGTERM (systemd stop) → _sigterm_handler() → _emergency_flush() → выход
+sys.exit() / исключение  → atexit.register()  → _emergency_flush()
+SIGKILL (OOM killer)     → ❌ нельзя поймать  → только Level 1 спасает
+```
+
+`_emergency_flush()` в `api_server.py` — простая, exception-safe функция:
+```python
+def _emergency_flush() -> None:
+    if agent is None or agent.store is None:
+        return
+    agent.store.flush(agent, min_attacks=..., save_sgd=True)
+```
+
+Хук регистрируется в `_register_shutdown_hooks()`, который вызывается в lifespan сразу после создания агента.
+
+**Максимально возможная потеря данных:**
+
+| Сценарий остановки | Потеря IP-данных | Потеря SGD |
+|--------------------|-----------------|------------|
+| `Ctrl+C` / `systemctl stop` | 0 (lifespan flush) | 0 |
+| SIGTERM | 0 (signal handler) | 0 |
+| Необработанное исключение | 0 (atexit) | 0 |
+| SIGKILL / OOM killer | ≤ 5 минут | ≤ 5 минут |
+| Аппаратный сбой | ≤ 5 минут | ≤ 5 минут |
+
+---
+
+### 12.7 Чеклист перед первым деплоем
 
 - [ ] Установить `API_KEY` в переменных окружения (`export API_KEY=<32-char-hex>`)
 - [ ] Убедиться, что `--workers 1` или настроен nginx `ip_hash`
 - [ ] Выбрать политику fail-open/fail-closed и зафиксировать её в коде
 - [ ] Установить таймаут на стороне клиента ≤ 1 секунда
 - [ ] Добавить circuit breaker (5 ошибок → 30s pause)
-- [ ] Настроить systemd / supervisor для автоперезапуска
+- [ ] Настроить systemd / supervisor для автоперезапуска (`Restart=on-failure`)
+- [ ] Убедиться, что systemd использует `KillSignal=SIGTERM` (по умолчанию) — не SIGKILL
 - [ ] Проверить доступность `/metrics` для Prometheus scrape
 - [ ] Запустить демо: `py -3 agent.py` — убедиться, что эскалация и автобан работают
 - [ ] Запустить регрессию: `py -3 bypass_r4.py` — 164/164 (100%)

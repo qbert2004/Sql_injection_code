@@ -27,8 +27,10 @@ Usage:
 """
 
 import asyncio
+import atexit
 import ipaddress
 import os
+import signal
 import time
 import traceback
 import uuid
@@ -56,7 +58,7 @@ setup_logging(level=cfg.logging.level, format=cfg.logging.format)
 log = get_logger("api_server")
 
 # ═══ Constants ═══
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 INFERENCE_TIMEOUT_SECONDS = 10  # Max time for a single detection call
 MAX_FIELDS = 50                 # Max fields per /api/validate request
 
@@ -71,6 +73,65 @@ logger: IncidentLogger | None = None
 # Rate limiting (sliding window with deque for O(1) append/popleft)
 _rate_limit_store: dict[str, deque] = {}
 _rate_limit_last_cleanup: float = 0.0
+
+# ── Emergency shutdown flush ────────────────────────────────────────────
+# Called by atexit (process exit) and SIGTERM handler.
+# Ensures SGD weights and IP profiles are persisted even when:
+#   - uvicorn receives SIGKILL (OOM killer) → atexit NOT called
+#   - SIGTERM (systemd stop / docker stop) → atexit IS called
+#   - Unhandled exception that exits the process → atexit IS called
+#
+# Note: atexit functions run in LIFO order, in the same thread that called
+#       sys.exit().  Keep this function fast and exception-safe.
+
+def _emergency_flush() -> None:
+    """
+    Best-effort flush of agent state on unexpected process exit.
+    Idempotent — safe to call multiple times.
+    """
+    global agent
+    if agent is None:
+        return
+    if agent.store is None:
+        return
+    try:
+        saved = agent.store.flush(
+            agent,
+            min_attacks=agent.config.persist_min_attacks,
+            save_sgd=True,
+        )
+        # Avoid using structured logger here — it may already be torn down
+        print(
+            f"[api_server] emergency_flush: {saved} profiles saved, "
+            f"sgd={'saved' if agent.online_learner._is_fitted else 'not fitted'}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[api_server] emergency_flush FAILED: {exc}", flush=True)
+
+
+def _register_shutdown_hooks() -> None:
+    """
+    Register atexit and SIGTERM handlers for emergency flush.
+
+    Why both?
+    - atexit: covers normal exit, unhandled exceptions, sys.exit()
+    - SIGTERM: covers systemd/docker graceful stop (before atexit fires)
+
+    SIGKILL cannot be caught — nothing survives it.  The periodic flush
+    in agent_cleanup_loop (every 300s) limits data loss to ≤5 minutes.
+    """
+    atexit.register(_emergency_flush)
+
+    # Install SIGTERM handler only on non-Windows (uvicorn manages signals on Win)
+    if os.name != "nt":
+        def _sigterm_handler(signum, frame):  # noqa: ARG001
+            _emergency_flush()
+            # Re-raise default SIGTERM so the process actually exits
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
 # ═══ Lifespan (startup + shutdown) ═══
@@ -89,14 +150,21 @@ async def lifespan(app: FastAPI):
     store = AgentStore(db_path=agent_db_path)
     agent = SQLiAgent(detector, store=store)
 
-    # Restore persisted bans and reputation from previous run
-    loaded_profiles = store.load_into(agent)
+    # Register atexit + SIGTERM emergency flush (must be done after agent is created)
+    _register_shutdown_hooks()
+
+    # Restore persisted bans, reputation, and SGD model from previous run
+    loaded_profiles = store.load_into(agent, load_sgd=True)
     if loaded_profiles:
         log.info("agent_state_loaded", profiles=loaded_profiles, db=agent_db_path)
         try:
             metrics.agent_persistence_loads.inc()
         except Exception:
             pass
+    if agent.online_learner._is_fitted:
+        log.info("agent_sgd_restored",
+                 path=agent.config.sgd_model_path,
+                 msg="SGD online layer restored from disk — no retraining needed")
 
     logger = IncidentLogger(db_path=cfg.incidents.db_path)
 
@@ -129,11 +197,23 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
     log.info("server_shutting_down")
 
-    # Final persistence flush before shutdown (save all active bans + reputation)
+    # Final persistence flush before shutdown (save all active bans + reputation + SGD)
     if agent is not None and agent.store is not None:
         try:
-            saved = agent.store.flush(agent, min_attacks=agent.config.persist_min_attacks)
-            log.info("agent_state_flushed_on_shutdown", profiles_saved=saved)
+            saved = agent.store.flush(
+                agent,
+                min_attacks=agent.config.persist_min_attacks,
+                save_sgd=True,  # ← persist fitted SGD weights across restarts
+            )
+            sgd_saved = agent.online_learner._is_fitted
+            log.info("agent_state_flushed_on_shutdown",
+                     profiles_saved=saved,
+                     sgd_saved=sgd_saved,
+                     sgd_path=agent.config.sgd_model_path if sgd_saved else None)
+            try:
+                metrics.agent_persistence_saves.inc()
+            except Exception:
+                pass
         except Exception as e:
             log.error("agent_state_flush_failed", error=str(e))
 
