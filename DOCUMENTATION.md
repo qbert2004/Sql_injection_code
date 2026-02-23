@@ -1,7 +1,7 @@
 # SQL Injection Protection System — Полная документация
 
-> Версия системы: 3.4.0 (production-ready)
-> Дата: 2026-02-23
+> Версия системы: 3.4.1 (production-ready)
+> Дата: 2026-02-24
 
 ---
 
@@ -1977,7 +1977,70 @@ def _emergency_flush() -> None:
 
 ---
 
-### 12.7 Чеклист перед первым деплоем
+### 12.7 Защита от DoS на уровне ввода (v3.4.1)
+
+**Проблема из threat model (D — Denial of Service):** очень длинная строка на вход CNN создаёт линейную нагрузку. До v3.4.1 `POST /api/validate` не ограничивал длину отдельных значений полей.
+
+**Что реализовано:**
+
+| Ограничение | Эндпоинт | Значение | Поведение при превышении |
+|-------------|----------|---------|--------------------------|
+| Длина текста | `POST /api/check` | 10 000 символов | Pydantic → HTTP 422 |
+| Длина значения поля | `POST /api/validate` | 10 000 символов | Truncate + сообщить в `truncated_fields` |
+| Длина ключа поля | `POST /api/validate` | 256 символов | HTTP 400 |
+| Количество полей | `POST /api/validate` | 50 полей | HTTP 400 |
+
+**Почему truncate, а не reject для `/api/validate`:** атаки в 99% случаев содержат паттерн в первых нескольких сотнях символов. Rejection при превышении 10k символов создаёт ложные срабатывания для текстовых полей (комментарии, биографии). Truncation позволяет проверить видимую часть и сообщить о факте усечения.
+
+```json
+// Ответ при усечённых полях:
+{
+  "safe": true,
+  "blocked_fields": [],
+  "results": {...},
+  "truncated_fields": ["bio", "description"],
+  "processing_time_ms": 34.2
+}
+```
+
+---
+
+### 12.8 Kubernetes / health endpoints
+
+Доступны два стандартных probe endpoint (не требуют API-ключа, не логируются):
+
+```yaml
+# kubernetes deployment.yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 5000
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 5000
+  initialDelaySeconds: 30      # время загрузки моделей
+  periodSeconds: 5
+  failureThreshold: 2
+```
+
+| Endpoint | Проверяет | HTTP 200 когда | HTTP 503 когда |
+|----------|-----------|----------------|----------------|
+| `GET /healthz` | Процесс жив, event loop отвечает | Всегда (если процесс запущен) | Никогда* |
+| `GET /readyz` | RF или CNN загружен, агент инициализирован | Модели загружены | Инициализация не завершена |
+| `GET /api/health` | Всё + статистика инцидентов | Всегда | Никогда |
+
+\* Если `/healthz` не отвечает — процесс завис, k8s перезапускает pod.
+
+**Разделение liveness и readiness критически важно:** если использовать один endpoint для обоих, медленная загрузка моделей (~15-30s) приведёт к бесконечному циклу перезапуска pod.
+
+---
+
+### 12.9 Чеклист перед первым деплоем
 
 - [ ] Установить `API_KEY` в переменных окружения (`export API_KEY=<32-char-hex>`)
 - [ ] Убедиться, что `--workers 1` или настроен nginx `ip_hash`
@@ -1986,6 +2049,7 @@ def _emergency_flush() -> None:
 - [ ] Добавить circuit breaker (5 ошибок → 30s pause)
 - [ ] Настроить systemd / supervisor для автоперезапуска (`Restart=on-failure`)
 - [ ] Убедиться, что systemd использует `KillSignal=SIGTERM` (по умолчанию) — не SIGKILL
+- [ ] Настроить `/healthz` как liveness probe, `/readyz` как readiness probe
 - [ ] Проверить доступность `/metrics` для Prometheus scrape
 - [ ] Запустить демо: `py -3 agent.py` — убедиться, что эскалация и автобан работают
 - [ ] Запустить регрессию: `py -3 bypass_r4.py` — 164/164 (100%)

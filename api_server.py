@@ -61,6 +61,8 @@ log = get_logger("api_server")
 VERSION = "3.4.0"
 INFERENCE_TIMEOUT_SECONDS = 10  # Max time for a single detection call
 MAX_FIELDS = 50                 # Max fields per /api/validate request
+MAX_TEXT_LENGTH = 10_000        # Max characters per text input (DoS mitigation)
+MAX_FIELD_KEY_LENGTH = 256      # Max length of a field name key in /api/validate
 
 # Thread pool for CPU-bound inference (prevents blocking async event loop)
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sqli-inference")
@@ -473,12 +475,36 @@ def check_api_key(request: Request) -> None:
 # ═══ Request / Response Models ═══
 
 class CheckRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=10000, description="Text to analyze")
-    field_name: str | None = Field(None, description="Field name for logging context")
+    text: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_TEXT_LENGTH,
+        description="Text to analyze for SQL injection",
+    )
+    field_name: str | None = Field(
+        None,
+        max_length=MAX_FIELD_KEY_LENGTH,
+        description="Field name for logging context",
+    )
 
 
 class ValidateRequest(BaseModel):
-    fields: dict[str, str] = Field(..., description="Form fields to validate")
+    """
+    Multi-field form validation request.
+
+    Security limits:
+      - max MAX_FIELDS fields per request (prevents CPU exhaustion)
+      - each field value capped at MAX_TEXT_LENGTH (prevents DoS on CNN)
+      - each field key capped at MAX_FIELD_KEY_LENGTH (prevents log bloat)
+
+    Fields exceeding the value length limit are truncated server-side
+    after validation — the truncation itself is reported in the response.
+    """
+    fields: dict[str, str] = Field(
+        ...,
+        description=f"Form fields to validate. Max {MAX_FIELDS} fields, "
+                    f"max {MAX_TEXT_LENGTH} chars per value.",
+    )
 
 
 class FeedbackRequest(BaseModel):
@@ -543,6 +569,64 @@ async def health():
             "max_input_length": cfg.normalization.max_input_length,
             "auth_enabled": cfg.api.api_key is not None,
         },
+    }
+
+
+@app.get("/healthz", tags=["System"], include_in_schema=False)
+async def liveness():
+    """
+    Kubernetes liveness probe — is the process alive?
+
+    Returns 200 if the process is running and the event loop is responsive.
+    Does NOT check model state or database connectivity (those are readiness concerns).
+    A failing liveness probe causes k8s to restart the pod.
+
+    curl http://localhost:5000/healthz
+    """
+    return {"status": "alive"}
+
+
+@app.get("/readyz", tags=["System"], include_in_schema=False)
+async def readiness():
+    """
+    Kubernetes readiness probe — is the server ready to serve traffic?
+
+    Returns 200 only if:
+      - At least one ML model (RF or CNN) is loaded
+      - The agent is initialized
+
+    Returns 503 if the server is still starting up (models loading).
+    A failing readiness probe causes k8s to stop routing traffic to this pod
+    without restarting it — correct behavior during model loading.
+
+    curl http://localhost:5000/readyz
+    """
+    if detector is None or agent is None:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "reason": "Server initializing — models not yet loaded",
+            },
+        )
+
+    if not detector.rf_loaded and not detector.cnn_loaded:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "reason": "No ML models loaded — RF and CNN both unavailable",
+                "rf_loaded": False,
+                "cnn_loaded": False,
+            },
+        )
+
+    return {
+        "status": "ready",
+        "rf_loaded": detector.rf_loaded,
+        "cnn_loaded": detector.cnn_loaded,
+        "agent_active": agent is not None,
+        "tracked_ips": len(agent.ip_memory._profiles) if agent else 0,
     }
 
 
@@ -648,12 +732,27 @@ async def validate_form(req: ValidateRequest, request: Request):
             detail=f"Too many fields: {len(req.fields)}. Maximum allowed: {MAX_FIELDS}"
         )
 
+    # Validate field key lengths (prevent log injection / memory bloat)
+    oversized_keys = [k for k in req.fields if len(k) > MAX_FIELD_KEY_LENGTH]
+    if oversized_keys:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Field key(s) exceed maximum length of {MAX_FIELD_KEY_LENGTH}: "
+                   f"{[k[:40] + '...' for k in oversized_keys[:5]]}",
+        )
+
     results = {}
     blocked_fields = []
     incident_ids = []
+    truncated_fields: list[str] = []   # fields whose values were truncated
 
     for fname, fvalue in req.fields.items():
         if isinstance(fvalue, str) and len(fvalue) > 0:
+            # Truncate oversized values — run detection on first MAX_TEXT_LENGTH chars
+            # to prevent CNN DoS while still catching injection in the visible portion.
+            if len(fvalue) > MAX_TEXT_LENGTH:
+                fvalue = fvalue[:MAX_TEXT_LENGTH]
+                truncated_fields.append(fname)
             result = await _run_detection(
                 fvalue,
                 source_ip=client_ip,
@@ -692,6 +791,8 @@ async def validate_form(req: ValidateRequest, request: Request):
         "results": results,
         "processing_time_ms": round(elapsed, 2),
         "incident_ids": incident_ids if incident_ids else None,
+        # Operational transparency: inform caller if values were truncated
+        "truncated_fields": truncated_fields if truncated_fields else None,
     }
 
 
