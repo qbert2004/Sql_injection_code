@@ -58,7 +58,7 @@ setup_logging(level=cfg.logging.level, format=cfg.logging.format)
 log = get_logger("api_server")
 
 # ═══ Constants ═══
-VERSION = "3.4.0"
+VERSION = "3.6.0"
 INFERENCE_TIMEOUT_SECONDS = 10  # Max time for a single detection call
 MAX_FIELDS = 50                 # Max fields per /api/validate request
 MAX_TEXT_LENGTH = 10_000        # Max characters per text input (DoS mitigation)
