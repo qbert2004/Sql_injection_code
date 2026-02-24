@@ -1,6 +1,6 @@
 # SQL Injection Protection System — Полная документация
 
-> Версия системы: 3.6.0 (production-ready)
+> Версия системы: 3.7.0 (production-ready)
 > Дата: 2026-02-24
 
 ---
@@ -102,6 +102,7 @@ HTTP POST /api/check
 | `metrics.py` | Prometheus метрики: счетчики запросов, детекций, блокировок, латентность + 8 новых agent-метрик |
 | `test_agent.py` | pytest unit-тесты агента: 97 тестов — Rules A–F, LRU, SGD, ASTLayer, atomic persistence |
 | `test_api.py` | pytest API integration tests: 85 тестов — все endpoints, auth, DoS limits, E2E detection flows |
+| `test_fuzz.py` | Hypothesis property-based + adversarial fuzz: 199 тестов — safety properties, obfuscation corpus, FP safety, structural invariants, mutation regression |
 | `bypass_r4.py` | Регрессионный тест: 164 продвинутых adversarial payload'а (round 4), проверяет архитектурные уязвимости |
 | `bypass_r3.py` | Регрессионный тест: ~232 adversarial payload'а (round 3), широкий охват техник обхода |
 | `ultimate_test.py` | Расширенный тест с проверкой точности по категориям атак и ложных срабатываний |
@@ -1736,10 +1737,20 @@ deny 5.6.7.8;
 | ✅ L | AST layer (sqlglot) | Малая (~120 строк) | Высокий (detection) | Готово (v3.5.0) |
 | ✅ M | Atomic SGD persistence | Малая (15 строк) | Средний (reliability) | Готово (v3.5.0) |
 | ✅ N | API integration tests | Средняя (85 тестов) | Высокий (quality gate) | Готово (v3.6.0) |
+| ✅ O | Fuzz & adversarial testing | Средняя (199 тестов) | Высокий (resilience) | Готово (v3.7.0) |
 
-**Минимальный набор для 9/10:** ~~A~~ ✅ + ~~C~~ ✅ + ~~L~~ ✅ + ~~N~~ ✅ + D + E + I.
+**Минимальный набор для 9/10:** ~~A~~ ✅ + ~~C~~ ✅ + ~~L~~ ✅ + ~~N~~ ✅ + ~~O~~ ✅ + D + E + I.
 
-**Для 10/10 (enterprise-grade):** + B (Redis) + F (periodic retraining) + H (API tests).
+**Для 10/10 (enterprise-grade):** + B (Redis) + F (periodic retraining) + I (Prometheus alerts).
+
+### Задокументированные detection gaps (v3.7.0)
+
+| Gap | Описание | Severity | Mitigation |
+|-----|----------|----------|------------|
+| Char-level comment split | `S/**/E/**/L/**/E/**/C/**/T` не восстанавливается | Medium | Hex-decode normalisation layer (v4.x) |
+| Standalone hex blob | `0x2720554e494f4e...` без SQL контекста | Low | Hex regex signature (future) |
+| Second-order injection | Хранится в БД, детектируется при записи, не при чтении | High | Архитектурный предел |
+| Multi-worker memory | Разные воркеры не делятся IP-памятью | Medium | Redis backend (Roadmap B) |
 
 ---
 
