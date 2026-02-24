@@ -32,6 +32,7 @@ import pytest
 from agent import (
     AgentConfig,
     AgentStore,
+    ASTLayer,
     IPMemory,
     IPProfile,
     SessionContext,
@@ -41,6 +42,7 @@ from agent import (
     PredictiveDefense,
     SQLiAgent,
     _SKLEARN_AVAILABLE,
+    _SQLGLOT_AVAILABLE,
 )
 from sql_injection_detector import EnsembleConfig
 
@@ -1325,6 +1327,282 @@ class TestSGDPersistence:
 
         # _is_fitted should remain False
         assert not agent.online_learner._is_fitted
+
+
+# ─────────────────────────────────────────────────────────────
+#  ASTLayer (Layer 1.5 — sqlglot)
+# ─────────────────────────────────────────────────────────────
+
+class TestASTLayer:
+    """
+    Tests for the sqlglot-based AST structural analysis layer.
+    Skipped entirely if sqlglot is not installed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def require_sqlglot(self):
+        if not _SQLGLOT_AVAILABLE:
+            pytest.skip("sqlglot not installed — ASTLayer unavailable")
+
+    def test_available_when_sqlglot_installed(self):
+        layer = ASTLayer()
+        assert layer.available is True
+
+    # ── True positives: dangerous SQL structures ───────────────
+
+    def test_union_select_quoted_payload(self):
+        """Classic UNION SELECT after closing quote — must be detected."""
+        layer = ASTLayer()
+        hit, reason, node = layer.check("' UNION SELECT password FROM users--")
+        assert hit is True, f"Expected HIT for UNION payload, got SAFE (reason={reason})"
+        assert "Union" in node or "union" in reason.lower()
+
+    def test_union_bare(self):
+        """UNION SELECT without leading quote."""
+        layer = ASTLayer()
+        hit, reason, node = layer.check("1 UNION SELECT NULL, NULL, NULL--")
+        assert hit is True
+
+    def test_stacked_drop(self):
+        """Stacked query with DROP TABLE via semicolon."""
+        layer = ASTLayer()
+        hit, reason, node = layer.check("'; DROP TABLE users--")
+        assert hit is True
+        assert "Drop" in node or "drop" in reason.lower()
+
+    def test_insert_statement(self):
+        """INSERT INTO as standalone SQL structure."""
+        layer = ASTLayer()
+        hit, reason, node = layer.check("INSERT INTO logs VALUES (1, 'x')")
+        assert hit is True
+
+    def test_select_with_from(self):
+        """SELECT with FROM clause = structurally valid SQL query."""
+        layer = ASTLayer()
+        hit, reason, node = layer.check("SELECT * FROM users WHERE id=1")
+        assert hit is True
+
+    def test_subquery_detected(self):
+        """Subquery in UNION context."""
+        layer = ASTLayer()
+        hit, reason, node = layer.check(
+            "1 UNION SELECT (SELECT password FROM admin LIMIT 1)--"
+        )
+        assert hit is True
+
+    # ── True negatives: safe inputs must not be flagged ────────
+
+    def test_safe_plain_text(self):
+        layer = ASTLayer()
+        hit, _, _ = layer.check("hello world")
+        assert hit is False, "Plain text should not trigger AST hit"
+
+    def test_safe_email(self):
+        layer = ASTLayer()
+        hit, _, _ = layer.check("user@example.com")
+        assert hit is False
+
+    def test_safe_date(self):
+        layer = ASTLayer()
+        hit, _, _ = layer.check("2024-01-15")
+        assert hit is False
+
+    def test_safe_number(self):
+        layer = ASTLayer()
+        hit, _, _ = layer.check("42")
+        assert hit is False
+
+    def test_safe_password_string(self):
+        layer = ASTLayer()
+        hit, _, _ = layer.check("P@ssw0rd123!")
+        assert hit is False
+
+    def test_tautology_no_struct(self):
+        """Tautology like 1=1 has no dangerous SQL structure (no FROM/UNION/DROP)."""
+        layer = ASTLayer()
+        hit, _, _ = layer.check("1 AND 1=1")
+        assert hit is False, "Simple tautology without SQL structure should be SAFE"
+
+    def test_comment_injection_no_struct(self):
+        """Comment injection alone is not a structural SQL hit."""
+        layer = ASTLayer()
+        hit, _, _ = layer.check("admin'--")
+        assert hit is False
+
+    def test_empty_string(self):
+        layer = ASTLayer()
+        hit, reason, node = layer.check("")
+        assert hit is False
+        assert reason == ""
+        assert node == ""
+
+    # ── Return value contract ──────────────────────────────────
+
+    def test_returns_three_tuple(self):
+        """check() always returns (bool, str, str)."""
+        layer = ASTLayer()
+        result = layer.check("SELECT 1 FROM dual")
+        assert isinstance(result, tuple) and len(result) == 3
+        hit, reason, node = result
+        assert isinstance(hit, bool)
+        assert isinstance(reason, str)
+        assert isinstance(node, str)
+
+    def test_no_hit_returns_empty_strings(self):
+        layer = ASTLayer()
+        hit, reason, node = layer.check("hello")
+        assert hit is False
+        assert reason == ""
+        assert node == ""
+
+    # ── Agent integration ──────────────────────────────────────
+
+    def test_ast_hit_escalates_safe_to_suspicious(self):
+        """
+        A text with a clear SQL structure (SELECT * FROM ...) that the mock
+        detector returns SAFE must be escalated to SUSPICIOUS by the AST layer.
+        """
+        cfg = AgentConfig(
+            enable_adaptive_thresholds=False,
+            enable_predictive_defense=False,
+            enable_online_learning=False,
+        )
+        # Mock detector returns SAFE for everything
+        agent = _make_agent(_safe_detector(), config=cfg)
+        result = agent.evaluate(
+            "SELECT * FROM users WHERE id=1",
+            source_ip="10.0.0.1",
+        )
+        assert result["agent_decision"] in ("SUSPICIOUS", "INJECTION"), (
+            "SQL SELECT structure should be escalated beyond SAFE by AST layer"
+        )
+        assert result.get("escalated") is True
+
+    def test_ast_stats_counted(self):
+        """ast_layer_hits counter increments on AST detection."""
+        cfg = AgentConfig(
+            enable_adaptive_thresholds=False,
+            enable_predictive_defense=False,
+            enable_online_learning=False,
+        )
+        agent = _make_agent(_safe_detector(), config=cfg)
+        before = agent._stats["ast_layer_hits"]
+        agent.evaluate("SELECT * FROM users", source_ip="10.0.0.2")
+        after = agent._stats["ast_layer_hits"]
+        assert after > before, "ast_layer_hits should increment on AST detection"
+
+    def test_ast_in_contributing_factors(self):
+        """contributing_factors must contain ast_match with hit=True on detection."""
+        cfg = AgentConfig(
+            enable_adaptive_thresholds=False,
+            enable_predictive_defense=False,
+            enable_online_learning=False,
+        )
+        agent = _make_agent(_safe_detector(), config=cfg)
+        result = agent.evaluate("1 UNION SELECT NULL--", source_ip="10.0.0.3")
+        factors = result.get("contributing_factors", {})
+        ast_match = factors.get("ast_match", {})
+        assert ast_match.get("hit") is True, (
+            "contributing_factors.ast_match.hit should be True on AST detection"
+        )
+
+    def test_ast_layer_in_get_stats(self):
+        """get_stats() must contain ast_layer section with available/hits/escalations."""
+        agent = _make_agent(_safe_detector())
+        stats = agent.get_stats()
+        assert "ast_layer" in stats
+        ast = stats["ast_layer"]
+        assert "available" in ast
+        assert "hits" in ast
+        assert "escalations" in ast
+        assert ast["available"] is _SQLGLOT_AVAILABLE
+
+
+# ─────────────────────────────────────────────────────────────
+#  Atomic SGD persistence
+# ─────────────────────────────────────────────────────────────
+
+class TestAtomicSGDPersistence:
+    """
+    Tests that save_sgd_model() uses atomic temp+rename and leaves no
+    .tmp file behind on success or failure.
+    """
+
+    @pytest.fixture
+    def tmp_paths(self, tmp_path):
+        return {
+            "db": str(tmp_path / "agent.db"),
+            "sgd": str(tmp_path / "model.joblib"),
+            "sgd_tmp": str(tmp_path / "model.joblib.tmp"),
+        }
+
+    @pytest.mark.skipif(not _SKLEARN_AVAILABLE, reason="sklearn not installed")
+    def test_no_tmp_file_after_successful_save(self, tmp_paths):
+        """After a successful save, the .tmp file must not exist."""
+        cfg = AgentConfig(
+            sgd_model_path=tmp_paths["sgd"],
+            enable_online_learning=True,
+            incremental_fit_batch_size=2,
+        )
+        agent = _make_agent(_injection_detector(), config=cfg)
+        store = AgentStore(db_path=tmp_paths["db"])
+
+        for _ in range(2):
+            agent.evaluate("' OR 1=1--", source_ip="5.5.5.5")
+        if not agent.online_learner._is_fitted:
+            agent.online_learner._incremental_fit()
+        if not agent.online_learner._is_fitted:
+            pytest.skip("SGD did not fit")
+
+        store.flush(agent, save_sgd=True)
+
+        assert os.path.exists(tmp_paths["sgd"]), "Model file must exist after save"
+        assert not os.path.exists(tmp_paths["sgd_tmp"]), (
+            ".tmp file must be cleaned up after successful atomic rename"
+        )
+
+    @pytest.mark.skipif(not _SKLEARN_AVAILABLE, reason="sklearn not installed")
+    def test_model_file_readable_after_atomic_save(self, tmp_paths):
+        """
+        After atomic save the model file must be loadable and return the
+        same classifier type that was saved.
+        """
+        cfg = AgentConfig(
+            sgd_model_path=tmp_paths["sgd"],
+            enable_online_learning=True,
+            incremental_fit_batch_size=2,
+        )
+        agent = _make_agent(_injection_detector(), config=cfg)
+        store = AgentStore(db_path=tmp_paths["db"])
+
+        for _ in range(2):
+            agent.evaluate("' OR 1=1--", source_ip="5.5.5.5")
+        if not agent.online_learner._is_fitted:
+            agent.online_learner._incremental_fit()
+        if not agent.online_learner._is_fitted:
+            pytest.skip("SGD did not fit")
+
+        store.flush(agent, save_sgd=True)
+
+        loaded = store.load_sgd_model(tmp_paths["sgd"])
+        assert loaded is not None, "load_sgd_model must succeed after atomic save"
+        clf, vectorizer = loaded
+        # Both objects must be present
+        assert clf is not None
+        assert vectorizer is not None
+
+    def test_save_sgd_returns_false_when_sklearn_unavailable(self, tmp_paths):
+        """save_sgd_model must return False gracefully without sklearn."""
+        store = AgentStore(db_path=tmp_paths["db"])
+        # Temporarily shadow _SKLEARN_AVAILABLE inside AgentStore.save_sgd_model
+        import agent as agent_module
+        orig = agent_module._SKLEARN_AVAILABLE
+        try:
+            agent_module._SKLEARN_AVAILABLE = False
+            result = store.save_sgd_model(None, None, tmp_paths["sgd"])
+            assert result is False
+        finally:
+            agent_module._SKLEARN_AVAILABLE = orig
 
 
 if __name__ == "__main__":
