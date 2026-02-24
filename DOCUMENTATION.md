@@ -1,6 +1,6 @@
 # SQL Injection Protection System — Полная документация
 
-> Версия системы: 3.4.1 (production-ready)
+> Версия системы: 3.5.0 (production-ready)
 > Дата: 2026-02-24
 
 ---
@@ -39,8 +39,10 @@ SQL Injection Protection System — это многоуровневая сист
 │  - Проверка бана IP                                      │
 │  - Предиктивная защита (вероятность атаки)               │
 │  - Адаптивные пороги (ниже для известных атакеров)       │
+│  - Сигнатурная проверка (Layer 1: regex)                 │
+│  - AST-анализ (Layer 1.5: sqlglot) ← NEW v3.5.0         │
 │  - Вызов детектора                                       │
-│  - Правила эскалации (A–F)                               │
+│  - Правила эскалации (A–F + AST)                         │
 │  - Онлайн-обучение (SGD)                                 │
 │  - Обновление памяти IP/сессии                           │
 └────────────────────────┬────────────────────────────────┘
@@ -1639,7 +1641,7 @@ async def live_feed(websocket: WebSocket):
 
 #### H. Полное покрытие тестами API-слоя
 
-**Что есть:** 73 теста для agent.py (`test_agent.py`), тесты детектора (`bypass_r4.py`).
+**Что есть:** 97 тестов для agent.py (`test_agent.py`), тесты детектора (`bypass_r4.py`).
 
 **Чего нет:** pytest-тесты для api_server.py с mock-инжекцией detector/agent.
 
@@ -1730,8 +1732,10 @@ deny 5.6.7.8;
 | I | Prometheus alert rules | Малая | Высокий (ops) | 🟡 Средний |
 | J | Экспорт банлиста nginx/iptables | Малая (20 строк) | Низкий | 🟢 Низкий |
 | K | VirusTotal/Shodan интеграция | Средняя | Низкий | 🟢 Низкий |
+| ✅ L | AST layer (sqlglot) | Малая (~120 строк) | Высокий (detection) | Готово (v3.5.0) |
+| ✅ M | Atomic SGD persistence | Малая (15 строк) | Средний (reliability) | Готово (v3.5.0) |
 
-**Минимальный набор для 9/10:** ~~A~~ ✅ + ~~C~~ ✅ + D + E + I (все малая/средняя сложность, высокий эффект).
+**Минимальный набор для 9/10:** ~~A~~ ✅ + ~~C~~ ✅ + ~~L~~ ✅ + D + E + I.
 
 **Для 10/10 (enterprise-grade):** + B (Redis) + F (periodic retraining) + H (API tests).
 
@@ -1902,36 +1906,17 @@ async def protect_request(text: str, ip: str) -> bool:
 | **Multi-worker** | IP-память несогласованна между воркерами | `--workers 1` или nginx `ip_hash` или Redis |
 | **No GPU** | CNN работает на CPU (~15–40ms вместо ~2ms на GPU) | `torch.device("cuda")` если GPU доступен |
 | **Vendor-specific** | `LPAD()`, `EXTRACTVALUE()`, `SYS.USER$` не все покрыты | Расширить сигнатуры в `OnlineLearning` |
-| **Нет AST-анализа** | Семантически корректный SQL (без хорошо известных паттернов) может пройти | Добавить `sqlglot` как Layer 1.5 |
+| ✅ **AST-анализ** | ~~Семантически корректный SQL может пройти~~ | Реализовано в v3.5.0 (`ASTLayer` + sqlglot) |
 
-**Добавление sqlglot (Layer 1.5) — ~50 строк кода:**
+**AST Layer 1.5 реализован в v3.5.0** (`agent.py → class ASTLayer`):
 
-```python
-# pip install sqlglot
-import sqlglot
-
-def _check_sql_ast(text: str) -> dict:
-    """
-    Parse text as SQL and flag structurally suspicious constructs.
-    Returns {"suspicious": bool, "reason": str}.
-    """
-    try:
-        tree = sqlglot.parse_one(text, error_level=sqlglot.ErrorLevel.IGNORE)
-    except Exception:
-        return {"suspicious": False, "reason": ""}
-
-    # Flag known dangerous patterns in AST
-    for node in tree.walk():
-        if isinstance(node, sqlglot.exp.Subquery):
-            return {"suspicious": True, "reason": "Nested subquery in AST"}
-        if isinstance(node, sqlglot.exp.Union):
-            return {"suspicious": True, "reason": "UNION in AST"}
-        if isinstance(node, (sqlglot.exp.Drop, sqlglot.exp.Delete)):
-            return {"suspicious": True, "reason": f"{type(node).__name__} statement"}
-    return {"suspicious": False, "reason": ""}
-```
-
-Этот вызов можно добавить в `SQLiAgent.evaluate()` до детектора как быстрый pre-check.
+- UNION SELECT после закрывающей кавычки — детектируется
+- Stacked queries (`;DROP TABLE`) — детектируется
+- SELECT с FROM — детектируется
+- Subquery в UNION — детектируется
+- Тавтологии (`1=1`), комментарии (`--`), email — **не** детектируются (0 FP на тестовом наборе)
+- `pip install sqlglot` / graceful degradation если не установлен
+- Статистика: `stats["ast_layer"]["hits"]` + `stats["ast_layer"]["escalations"]`
 
 ---
 
