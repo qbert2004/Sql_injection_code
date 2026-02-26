@@ -55,6 +55,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+# ── State backend abstraction (v3.7.0) ──────────────────────────────────────
+# AgentStore is now imported from state_backend so that SQLiteBackend and
+# RedisBackend share the same interface.  The name AgentStore is preserved
+# here as a re-export for backward compatibility with existing imports:
+#   from agent import AgentStore   ← still works
+from state_backend import (
+    SQLiteBackend,
+    RedisBackend,
+    NullBackend,
+    StateBackend,
+    make_backend,
+)
+AgentStore = SQLiteBackend   # backward-compat alias
+
 # ────────────────────────────────────────────────────────────
 # Optional ML deps for OnlineLearning (graceful degradation)
 # ────────────────────────────────────────────────────────────
@@ -137,264 +151,23 @@ def _agent_config_from_env(base: AgentConfig | None = None) -> AgentConfig:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  AgentStore — SQLite persistence for IP profiles + SGD model
+#  AgentStore — MOVED to state_backend.py  (v3.7.0)
+#
+#  AgentStore is now SQLiteBackend imported above.
+#  The class definition is kept here as a stub only to surface a
+#  clear error if something tries to subclass it directly.
 # ═══════════════════════════════════════════════════════════════
 
-class AgentStore:
+class AgentStore(SQLiteBackend):  # noqa: F811
     """
-    Thin SQLite-backed persistence layer for agent state.
+    Backward-compatibility stub — implementation moved to state_backend.SQLiteBackend.
 
-    Stores IP profiles (attack counts, bans, reputation) and the SGD model.
-    Operations are guarded by a threading.Lock (same-thread re-entrance not needed).
-
-    Schema is created lazily on first use — zero-config startup.
+    All logic lives in SQLiteBackend.  This subclass exists only so that:
+        from agent import AgentStore
+        store = AgentStore("agent_state.db")
+    continues to work without modification anywhere in the codebase.
     """
-
-    _SCHEMA = """
-    CREATE TABLE IF NOT EXISTS ip_profiles (
-        ip              TEXT PRIMARY KEY,
-        first_seen      REAL NOT NULL,
-        last_seen       REAL NOT NULL,
-        total_requests  INTEGER NOT NULL DEFAULT 0,
-        attack_count    INTEGER NOT NULL DEFAULT 0,
-        suspicious_count INTEGER NOT NULL DEFAULT 0,
-        attack_types    TEXT NOT NULL DEFAULT '{}',   -- JSON dict
-        endpoints       TEXT NOT NULL DEFAULT '[]',   -- JSON list
-        fields          TEXT NOT NULL DEFAULT '[]',   -- JSON list
-        is_banned       INTEGER NOT NULL DEFAULT 0,   -- BOOL
-        ban_until       REAL,
-        reputation_score REAL NOT NULL DEFAULT 0.0
-    );
-
-    CREATE TABLE IF NOT EXISTS agent_meta (
-        key   TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    );
-    """
-
-    def __init__(self, db_path: str = "agent_state.db") -> None:
-        self.db_path = db_path
-        self._lock = threading.Lock()           # guards SQLite writes
-        self._flush_lock = threading.Lock()     # prevents concurrent flush() calls
-        # Concurrent flush() is safe at the SQLite level (WAL mode) but wasteful:
-        # two threads would snapshot the same data and write identical rows.
-        # More importantly, the SGD save (joblib.dump) is NOT atomic — a second
-        # concurrent save could corrupt the file if it writes while the first is
-        # mid-write.  _flush_lock serialises all flush() calls.
-        self._init_db()
-
-    # ── Lifecycle ─────────────────────────────────────────────
-
-    def _init_db(self) -> None:
-        """Create tables if they do not exist."""
-        try:
-            with self._connect() as conn:
-                conn.executescript(self._SCHEMA)
-        except Exception as e:
-            # Non-fatal: agent runs without persistence
-            print(f"[AgentStore] WARNING: Could not init DB at {self.db_path!r}: {e}")
-
-    def _connect(self) -> sqlite3.Connection:
-        """Open a connection with WAL mode for better concurrency."""
-        conn = sqlite3.connect(self.db_path, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    # ── Load ──────────────────────────────────────────────────
-
-    def load_into(self, agent: "SQLiAgent", load_sgd: bool = True) -> int:
-        """
-        Load persisted IP profiles into agent IPMemory.
-        If load_sgd=True and a SGD model file exists at agent.config.sgd_model_path,
-        also restores the online learning layer without needing retraining
-        (Roadmap A — restore SGD on startup).
-        Returns number of profiles loaded.
-        Expired bans are automatically cleared during load.
-        """
-        loaded = 0
-        now = time.time()
-        try:
-            with self._lock, self._connect() as conn:
-                rows = conn.execute(
-                    "SELECT * FROM ip_profiles WHERE attack_count > 0 OR is_banned = 1"
-                ).fetchall()
-
-            for row in rows:
-                with agent.ip_memory._lock:
-                    p = agent.ip_memory.get_profile(row["ip"])
-                    p.first_seen = row["first_seen"]
-                    p.last_seen = row["last_seen"]
-                    p.total_requests = row["total_requests"]
-                    p.attack_count = row["attack_count"]
-                    p.suspicious_count = row["suspicious_count"]
-                    p.attack_types = Counter(json.loads(row["attack_types"] or "{}"))
-                    p.endpoints_targeted = set(json.loads(row["endpoints"] or "[]"))
-                    p.fields_targeted = set(json.loads(row["fields"] or "[]"))
-                    p.reputation_score = row["reputation_score"]
-
-                    # Restore ban (may be expired — checked lazily in is_banned())
-                    ban_until = row["ban_until"]
-                    if row["is_banned"] and ban_until and ban_until > now:
-                        p.is_banned = True
-                        p.ban_until = ban_until
-                    else:
-                        p.is_banned = False
-                        p.ban_until = None
-
-                    loaded += 1
-
-        except Exception as e:
-            print(f"[AgentStore] WARNING: load_into failed: {e}")
-
-        # ── SGD model restore (Roadmap A) ─────────────────────
-        if load_sgd and hasattr(agent, "online_learner"):
-            ol = agent.online_learner
-            if ol._enabled:
-                model_path = getattr(agent.config, "sgd_model_path", "agent_sgd.joblib")
-                result = self.load_sgd_model(model_path)
-                if result is not None:
-                    clf, vectorizer = result
-                    with ol._lock:
-                        ol._clf = clf
-                        ol._vectorizer = vectorizer
-                        ol._is_fitted = True
-
-        return loaded
-
-    # ── Flush ─────────────────────────────────────────────────
-
-    def flush(self, agent: "SQLiAgent", min_attacks: int = 1, save_sgd: bool = True) -> int:
-        """
-        Persist all IP profiles from agent memory to SQLite.
-        Only persists IPs with >= min_attacks (skips clean traffic).
-        If save_sgd=True and the online SGD layer is fitted, also saves it to disk
-        at agent.config.sgd_model_path (Roadmap A — auto-save on shutdown).
-        Returns number of rows upserted.
-
-        Thread safety: guarded by _flush_lock to prevent concurrent flushes.
-        Concurrent flush calls are safe at the SQLite level (WAL mode) but the
-        SGD joblib.dump() is NOT atomic — interleaved writes could corrupt the
-        model file.  _flush_lock serialises all callers (cleanup loop, atexit,
-        lifespan shutdown) without blocking normal detect() calls.
-        """
-        # Non-blocking trylock: if a flush is already in progress, skip this call.
-        # This prevents the atexit handler from blocking behind a slow periodic flush.
-        acquired = self._flush_lock.acquire(blocking=True, timeout=8.0)
-        if not acquired:
-            print("[AgentStore] WARNING: flush() skipped — another flush is in progress")
-            return 0
-
-        saved = 0
-        try:
-            # Snapshot profiles under lock to minimize contention
-            with agent.ip_memory._lock:
-                snapshot = [
-                    (ip, p) for ip, p in agent.ip_memory._profiles.items()
-                    if p.attack_count >= min_attacks or p.is_banned
-                ]
-
-            rows = []
-            for ip, p in snapshot:
-                rows.append((
-                    ip,
-                    p.first_seen,
-                    p.last_seen,
-                    p.total_requests,
-                    p.attack_count,
-                    p.suspicious_count,
-                    json.dumps(dict(p.attack_types)),
-                    json.dumps(list(p.endpoints_targeted)),
-                    json.dumps(list(p.fields_targeted)),
-                    int(p.is_banned),
-                    p.ban_until,
-                    p.reputation_score,
-                ))
-
-            if rows:
-                with self._lock, self._connect() as conn:
-                    conn.executemany(
-                        """INSERT INTO ip_profiles
-                           (ip, first_seen, last_seen, total_requests, attack_count,
-                            suspicious_count, attack_types, endpoints, fields,
-                            is_banned, ban_until, reputation_score)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                           ON CONFLICT(ip) DO UPDATE SET
-                               last_seen        = excluded.last_seen,
-                               total_requests   = excluded.total_requests,
-                               attack_count     = excluded.attack_count,
-                               suspicious_count = excluded.suspicious_count,
-                               attack_types     = excluded.attack_types,
-                               endpoints        = excluded.endpoints,
-                               fields           = excluded.fields,
-                               is_banned        = excluded.is_banned,
-                               ban_until        = excluded.ban_until,
-                               reputation_score = excluded.reputation_score
-                        """,
-                        rows,
-                    )
-                    saved = len(rows)
-
-        except Exception as e:
-            print(f"[AgentStore] WARNING: flush failed: {e}")
-        finally:
-            self._flush_lock.release()
-
-        # ── SGD model save (Roadmap A) ─────────────────────────
-        # Done outside _flush_lock to avoid holding it during slow joblib.dump().
-        # joblib.dump() is atomic at the OS level (write to temp + rename on POSIX).
-        if save_sgd and hasattr(agent, "online_learner"):
-            ol = agent.online_learner
-            if ol._enabled and ol._is_fitted:
-                model_path = getattr(agent.config, "sgd_model_path", "agent_sgd.joblib")
-                self.save_sgd_model(ol._clf, ol._vectorizer, model_path)
-
-        return saved
-
-    # ── SGD model ─────────────────────────────────────────────
-
-    def save_sgd_model(self, clf: Any, vectorizer: Any, model_path: str) -> bool:
-        """
-        Persist SGD model and vectorizer to disk via joblib.
-
-        Atomic write: writes to a sibling temp file first, then renames to
-        model_path.  On POSIX this is a single kernel call (atomic).
-        On Windows, os.replace() is used which handles the non-atomic case
-        better than a direct overwrite (target is replaced atomically if on
-        the same filesystem; temp and target share a directory here).
-
-        This prevents a corrupted model file if the process is killed mid-write.
-        """
-        if not _SKLEARN_AVAILABLE:
-            return False
-        # Build temp path next to the target (same filesystem → rename is atomic)
-        model_path_obj = model_path  # keep original for final rename
-        tmp_path = model_path + ".tmp"
-        try:
-            joblib.dump({"clf": clf, "vectorizer": vectorizer}, tmp_path)
-            os.replace(tmp_path, model_path_obj)   # atomic on POSIX; best-effort on Win
-            return True
-        except Exception as e:
-            print(f"[AgentStore] WARNING: save_sgd_model failed: {e}")
-            # Clean up temp file if it exists
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
-            return False
-
-    def load_sgd_model(self, model_path: str) -> tuple[Any, Any] | None:
-        """Load SGD model and vectorizer from disk."""
-        if not _SKLEARN_AVAILABLE or not os.path.exists(model_path):
-            return None
-        try:
-            data = joblib.load(model_path)
-            return data["clf"], data["vectorizer"]
-        except Exception as e:
-            print(f"[AgentStore] WARNING: load_sgd_model failed: {e}")
-            return None
+    # No overrides — inherits everything from SQLiteBackend.
 
 
 # ═══════════════════════════════════════════════════════════════

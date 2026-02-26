@@ -9,6 +9,25 @@
 # ============================================================
 
 services:
+  # ── Redis (optional distributed backend) ─────────────────────────────────
+  # Enable: docker-compose up --profile redis
+  # The API service will automatically use Redis when SQLI_BACKEND=redis.
+  redis:
+    image: redis:7.2-alpine
+    container_name: sqli-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    profiles:
+      - redis
+      - full
+
   api:
     build:
       context: .
@@ -21,10 +40,17 @@ services:
     environment:
       - APP_ENV=production
       - INCIDENTS_DB=/app/data/incidents.db
+      # Redis backend (activated when SQLI_BACKEND=redis in .env)
+      - SQLI_BACKEND=${SQLI_BACKEND:-sqlite}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
     volumes:
-      # Persist incident database across restarts
+      # Persist incident database + SQLite state across restarts
       - sqli-data:/app/data
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+        required: false   # redis is optional — API starts without it
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')"]
       interval: 30s
@@ -77,3 +103,10 @@ volumes:
     driver: local
   prometheus-data:
     driver: local
+
+# ── Usage profiles ────────────────────────────────────────────────────────────
+# docker-compose up                            # API only (SQLite backend)
+# docker-compose --profile redis up            # API + Redis backend
+# docker-compose --profile monitoring up       # API + Prometheus
+# docker-compose --profile demo up             # API + Streamlit demo
+# docker-compose --profile full up             # API + Redis + Prometheus + Demo
