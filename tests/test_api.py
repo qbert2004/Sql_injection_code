@@ -90,7 +90,7 @@ class TestHealth:
         resp = client.get("/api/health")
         data = resp.json()
         assert "version" in data
-        assert data["version"] == "3.1.0"
+        assert data["version"] == "3.7.0"
 
     def test_health_has_model_status(self, client):
         """Health response must include model loading status."""

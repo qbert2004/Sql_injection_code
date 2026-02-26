@@ -46,7 +46,23 @@ nul
 # Temporary files
 *.tmp
 *.temp
+_tmp_*.txt
+
+# Backup files
+*.bak
+*.pkl.bak
+
+# Runtime state files
+agent_state.db
+incidents.db
+
+# Server logs
+server_log.txt
+
+# Hypothesis testing cache
+.hypothesis/
 
 # Large datasets (keep only essential)
 *.csv
 !SQL_Dataset_Extended.csv
+data/massive_test_100k.csv

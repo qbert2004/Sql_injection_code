@@ -1,5 +1,5 @@
 # Core ML
-scikit-learn>=1.5.0
+scikit-learn==1.8.0  # pinned: models rf_sql_model.pkl + tfidf_vectorizer.pkl trained on 1.8.0
 numpy>=2.0.0
 scipy>=1.14.0
 joblib>=1.4.0
@@ -36,10 +36,14 @@ matplotlib>=3.10.0
 seaborn>=0.13.0
 streamlit>=1.30.0
 
+# Distributed state backend
+redis>=5.0.0           # RedisBackend (optional — graceful fallback to SQLite)
+
 # Testing
 pytest>=9.0.0
 pytest-asyncio>=1.3.0
 pytest-cov>=7.0.0
+fakeredis>=2.20.0      # Redis mock for test_distributed.py / test_state_backend.py
 
 # Security
 bleach>=6.3.0

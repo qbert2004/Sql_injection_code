@@ -108,6 +108,37 @@ class IncidentConfig:
 
 
 @dataclass(frozen=True)
+class BackendConfig:
+    """
+    State backend configuration — controls where IP profiles and SGD model
+    are persisted across restarts and worker processes.
+
+    backend_type values
+    -------------------
+    sqlite  (default) — single-node, zero-dependency, agent_state.db
+    redis             — distributed, needs REDIS_URL or REDIS_HOST/PORT
+    null              — stateless, no persistence (testing / ephemeral)
+
+    Redis env vars (only used when backend_type=redis)
+    --------------------------------------------------
+    REDIS_URL        full URL, e.g. redis://redis:6379/0
+    REDIS_HOST       localhost  (fallback if REDIS_URL not set)
+    REDIS_PORT       6379
+    REDIS_DB         0
+    REDIS_PASSWORD   (optional)
+    REDIS_TTL_DAYS   7  (IP profile expiry in days)
+    """
+    backend_type: str = "sqlite"          # sqlite | redis | null
+    sqlite_path: str = "agent_state.db"  # only used when backend_type=sqlite
+    redis_url: str | None = None          # overrides host/port when set
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_db: int = 0
+    redis_password: str | None = None
+    redis_ttl_days: int = 7
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Root application configuration."""
     app_env: str = "development"
@@ -118,6 +149,7 @@ class AppConfig:
     api: APIConfig = field(default_factory=APIConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     incidents: IncidentConfig = field(default_factory=IncidentConfig)
+    backend: BackendConfig = field(default_factory=BackendConfig)
 
 
 def _env(key: str, default: str = "") -> str:
@@ -205,6 +237,16 @@ def get_config() -> AppConfig:
         incidents=IncidentConfig(
             db_path=_env("INCIDENTS_DB", "incidents.db"),
             auto_cleanup_days=_env_int("CLEANUP_DAYS", 90),
+        ),
+        backend=BackendConfig(
+            backend_type=_env("SQLI_BACKEND", "sqlite"),
+            sqlite_path=_env("AGENT_STATE_DB", "agent_state.db"),
+            redis_url=_env("REDIS_URL") or None,
+            redis_host=_env("REDIS_HOST", "localhost"),
+            redis_port=_env_int("REDIS_PORT", 6379),
+            redis_db=_env_int("REDIS_DB", 0),
+            redis_password=_env("REDIS_PASSWORD") or None,
+            redis_ttl_days=_env_int("REDIS_TTL_DAYS", 7),
         ),
     )
 
