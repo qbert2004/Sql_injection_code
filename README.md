@@ -1,299 +1,190 @@
-# 🛡️ SQL Injection Detection System
+# SQL Injection Detection System
 
-> Система обнаружения SQL-инъекций на основе ансамбля ML-моделей и семантического анализа.
+Многоуровневая система обнаружения SQL-инъекций на основе ансамбля ML-моделей и семантического анализа.
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.121-green.svg)](https://fastapi.tiangolo.com/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
----
-
-## 📌 О проекте
-
-Это учебный пример промышленной системы безопасности, которая анализирует текстовый ввод и определяет, является ли он SQL-инъекцией. Проект демонстрирует, как сочетать машинное обучение с классическим программным анализом для решения задачи кибербезопасности.
-
-**Система умеет:**
-- Классифицировать запросы на 4 класса: `SAFE`, `INVALID`, `SUSPICIOUS`, `INJECTION`
-- Определять тип атаки (UNION, BOOLEAN, TIME-BASED, DROP TABLE и др.)
-- Объяснять своё решение пошагово (explainability)
-- Работать как REST API
-
-**Ключевые характеристики:**
-
 | Метрика | Значение |
 |---|---|
-| Точность обнаружения атак | **99.3%** |
+| Точность обнаружения | **99.3%** |
 | Ложные срабатывания | **1.5%** |
-| Время анализа | **~60 мс / запрос** (CPU) |
-| Типов атак распознаётся | **9** |
+| Время анализа | **~60 мс / запрос** |
+| Типов атак | **9** |
+| Тестов | **495 passed** |
 
 ---
 
-## 🏗️ Как это работает
+## Как это работает
 
-Каждый запрос проходит через **6 последовательных слоёв**:
+Каждый запрос проходит **7 слоёв**:
 
 ```
 Входной текст
     │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│  Слой 0 — Нормализация                                  │
-│  URL-декодирование, удаление null-байт, Unicode NFKC,   │
-│  удаление SQL-комментариев, нормализация пробелов        │
-└──────────────────────────┬──────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Слой 1 — Лексический фильтр (быстрый путь)             │
-│  Regex-скан по ключевым словам SQL.                      │
-│  Если SQL не обнаружен → сразу SAFE (без ML)            │
-└──────────────────────────┬──────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Слой 2 — ML Ансамбль                                   │
-│  ┌─────────────────┐     ┌──────────────────────────┐  │
-│  │  Random Forest  │     │       VDCNN-9 (CNN)       │  │
-│  │  вес = 0.35     │     │       вес = 0.65          │  │
-│  │  TF-IDF + feat  │     │  символьная нейросеть     │  │
-│  └────────┬────────┘     └────────────┬─────────────┘  │
-│           └──────────────┬────────────┘                 │
-│                   S = 0.35·P_rf + 0.65·P_cnn            │
-└──────────────────────────┬──────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Слой 3 — Семантическая валидация SQL                   │
-│  Парсинг структуры SQL (sqlglot), проверка на           │
-│  реальную SQL-атаку. Ключевой «предохранитель»:         │
-│  ML ОДИН не может поставить INJECTION — нужна семантика │
-└──────────────────────────┬──────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Слой 4 — Движок решений (8 правил приоритета)          │
-└──────────────────────────┬──────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Слой 5 — Серьёзность и действие                        │
-│  ALLOW / LOG / CHALLENGE / BLOCK                        │
-└──────────────────────────┬──────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  Слой 6 — Объяснение (Explainability)                   │
-│  Детальный trace, MITRE ATT&CK, SIEM-поля               │
-└─────────────────────────────────────────────────────────┘
+    ▼  Слой 0 — Нормализация
+       URL-декодирование, null-байты, Unicode NFKC, SQL-комментарии
+    │
+    ▼  Слой 1 — Лексический фильтр (быстрый путь)
+       Если SQL не обнаружен → сразу SAFE (без ML)
+    │
+    ▼  Слой 2 — ML Ансамбль
+       Random Forest (35%) + VDCNN-9 CNN (65%) = score S
+    │
+    ▼  Слой 3 — Семантическая валидация (sqlglot)
+       ML один не может поставить INJECTION — нужна семантика
+    │
+    ▼  Слой 4 — Движок решений (8 правил приоритета)
+    │
+    ▼  Слой 5 — Серьёзность и действие: ALLOW / LOG / BLOCK
+    │
+    ▼  Слой 6 — Объяснение (trace, MITRE ATT&CK, SIEM-поля)
 ```
 
-### Правила принятия решений
+### Модели
 
-| Правило | Условие | Решение | Действие |
-|---------|---------|---------|----------|
-| 0 | P_cnn ≥ 0.70 AND P_rf < 0.50 AND sem < 2.0 | INVALID | LOG |
-| 1 | S ≥ 0.60 AND sem ≥ 2.0 | **INJECTION** | **BLOCK** |
-| 2 | P_cnn ≥ 0.75 AND sem ≥ 3.0 | **INJECTION** | **BLOCK** |
-| 3 | P_rf ≥ 0.70 AND sem ≥ 2.0 | **INJECTION** | **BLOCK** |
-| 4 | S < 0.30 | SAFE | ALLOW |
-| 5 | sem ≥ 1.0 | SUSPICIOUS | CHALLENGE |
-| 6 | (по умолчанию) | INVALID | LOG |
+| Модель | Точность | Описание |
+|--------|----------|----------|
+| VDCNN-9 (CNN) | **99.90%** | Символьная нейросеть, PyTorch |
+| Random Forest | **99.18%** | TF-IDF + ручные признаки, scikit-learn |
+| Ансамбль | **99.30%** | 0.65 × CNN + 0.35 × RF |
 
-### Используемые модели
+### Типы обнаруживаемых атак
 
-| Модель | Тип | Точность | Параметры |
-|--------|-----|---------|-----------|
-| **VDCNN-9** | PyTorch CNN | **99.90%** | 7M, Conneau et al. 2017 |
-| **Random Forest** | scikit-learn | **99.18%** | TF-IDF + ручные признаки |
-| **Ансамбль** | Fusion (0.65 CNN + 0.35 RF) | **99.30%** | — |
+| Тип | Пример | Критичность |
+|-----|--------|-------------|
+| `BOOLEAN_BASED` | `' OR '1'='1` | MEDIUM |
+| `COMMENT_TRUNCATION` | `admin'--` | LOW |
+| `UNION_BASED` | `' UNION SELECT * FROM users--` | HIGH |
+| `TIME_BASED` | `' AND SLEEP(5)--` | MEDIUM |
+| `STACKED_QUERY` | `'; DROP TABLE users--` | CRITICAL |
+| `ERROR_BASED` | `' AND extractvalue(1,...)--` | HIGH |
+| `OS_COMMAND` | `'; EXEC xp_cmdshell('dir')--` | CRITICAL |
+| `OUT_OF_BAND` | DNS-эксфильтрация | CRITICAL |
 
 ---
 
-## 📁 Структура проекта
+## Быстрый старт
 
-```
-Sql_injection_code/
-│
-├── 🔧 Основной код
-│   ├── sql_injection_detector.py   # Детектор — 6-слойный пайплайн
-│   ├── agent.py                    # AI-агент: IP-репутация, сессии, эскалация
-│   ├── api_server.py               # REST API (FastAPI)
-│   ├── config.py                   # Конфигурация (env-переменные, датаклассы)
-│   ├── incident_logger.py          # Логирование инцидентов (SQLite + SIEM)
-│   ├── state_backend.py            # Хранилище состояния (SQLite / Redis)
-│   ├── logger.py                   # Структурированные логи (structlog)
-│   └── metrics.py                  # Prometheus-метрики
-│
-├── 🧠 Модели (models/)
-│   ├── char_cnn_model.py           # Архитектура VDCNN-9
-│   ├── char_bilstm_model.py        # Архитектура BiLSTM (альтернатива)
-│   ├── char_tokenizer.py           # Токенизатор на уровне символов
-│   ├── char_cnn_detector.pt        # Обученные веса CNN (PyTorch)
-│   └── char_bilstm_detector.pt     # Обученные веса BiLSTM
-│
-├── 🏋️ Обучение (training/)
-│   ├── train_rf.py                 # Обучение Random Forest
-│   ├── train_cnn.py                # Обучение VDCNN (CUDA + AMP)
-│   ├── train_bilstm.py             # Обучение BiLSTM
-│   └── generate_dataset.py         # Генерация датасета
-│
-├── 🧪 Тесты (tests/)
-│   ├── test_detector.py            # Юнит-тесты детектора
-│   ├── test_api.py                 # Интеграционные тесты API
-│   ├── test_adversarial_fuzz.py    # Фазз-тестирование
-│   ├── test_bypass_audit.py        # Аудит попыток обхода защиты
-│   ├── test_distributed.py         # Тесты распределённого состояния
-│   ├── test_state_backend.py       # Тесты бэкенда хранилища
-│   └── conftest.py                 # Фикстуры pytest
-│
-├── 📊 Данные (data/)
-│   ├── dataset.csv                 # Основной датасет
-│   └── massive_test_100k.csv       # 100k тестовых примеров
-│
-├── 🖥️ Демо и нагрузка
-│   ├── streamlit_demo.py           # Интерактивное веб-демо
-│   ├── benchmark.py                # Замер производительности (p50/p95/p99)
-│   ├── load_test.py                # Нагрузочное тестирование (multiprocessing)
-│   └── soak_test.py                # Длительное стресс-тестирование
-│
-├── 🐳 DevOps
-│   ├── Dockerfile
-│   ├── docker-compose.yml          # API + Redis + Prometheus + Grafana
-│   └── .github/workflows/          # CI/CD
-│
-└── 📚 Документация
-    ├── README.md                   # ← вы здесь
-    ├── DOCUMENTATION.md            # Полная техническая документация
-    ├── ARCHITECTURE_10_10.md       # Детальное описание архитектуры
-    ├── SECURITY_WHITEPAPER.md      # Whitepaper по безопасности
-    ├── CHANGELOG.md                # История версий
-    └── VDCNN_Model.ipynb           # Jupyter-ноутбук: обучение модели
-```
-
----
-
-## 🚀 Быстрый старт
-
-### 1. Клонировать репозиторий
+### 1. Клонировать и установить
 
 ```bash
 git clone https://github.com/qbert2004/Sql_injection_code.git
 cd Sql_injection_code
-```
 
-### 2. Создать виртуальное окружение
-
-```bash
 python -m venv .venv
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # Linux / macOS
 
-# Windows
-.venv\Scripts\activate
-
-# Linux / macOS
-source .venv/bin/activate
-```
-
-### 3. Установить зависимости
-
-```bash
 pip install -r requirements.txt
 ```
 
-> ⚠️ Для полной функциональности нужны `torch` и `scikit-learn`. Без них система работает в режиме деградации (только лексический фильтр).
+### 2. Запустить API-сервер
 
-### 4. Запустить
-
-**Вариант A — API-сервер:**
 ```bash
-python api_server.py
-# Сервер: http://localhost:5000
-# Swagger UI: http://localhost:5000/docs
+.venv\Scripts\python -m uvicorn api_server:app --host 0.0.0.0 --port 5000
 ```
 
-**Вариант B — Интерактивное демо:**
+- API: `http://localhost:5000`
+- Swagger UI: `http://localhost:5000/docs`
+
+### 3. Запустить демо-сайт (TenderPro)
+
 ```bash
-streamlit run streamlit_demo.py
-# Браузер: http://localhost:8501
+.venv\Scripts\python demo_site.py
 ```
 
-**Вариант C — Python напрямую:**
+- Сайт закупок: `http://localhost:8080`
+- Панель безопасности (SOC): `http://localhost:8080/admin`
+
+### 4. Использовать как библиотеку
+
 ```python
 from sql_injection_detector import SQLInjectionEnsemble
 
 detector = SQLInjectionEnsemble()
 
-# Безопасный запрос
-result = detector.detect("SELECT * FROM users WHERE id = 1")
-print(result['decision'])      # SAFE
-print(result['action'])        # ALLOW
-
-# SQL-инъекция
 result = detector.detect("' OR '1'='1")
-print(result['decision'])      # INJECTION
-print(result['action'])        # BLOCK
-print(result['attack_type'])   # BOOLEAN_BASED
-print(result['score'])         # 1.0
-print(result['severity'])      # MEDIUM
+print(result['decision'])     # INJECTION
+print(result['action'])       # BLOCK
+print(result['attack_type'])  # BOOLEAN_BASED
+print(result['score'])        # 1.0
 ```
 
 ---
 
-## 🔌 REST API
+## Интеграция в существующий проект
 
-### Проверить одну строку
+Система встаёт между вашим приложением и базой данных:
 
-```http
-POST http://localhost:5000/api/check
-Content-Type: application/json
-
-{
-  "text": "' UNION SELECT username, password FROM users--"
-}
+```
+Пользователь → Ваш сайт → [SQL Injection Detector] → База данных
 ```
 
-**Ответ:**
+**Вариант 1 — через API** (любой язык):
+
+```python
+import requests
+
+def is_safe(user_input: str) -> bool:
+    r = requests.post("http://localhost:5000/api/check",
+                      json={"text": user_input})
+    return r.json()["decision"] == "SAFE"
+
+# В коде сайта — перед любым SQL-запросом:
+if not is_safe(request.form["username"]):
+    return "403 Forbidden", 403
+```
+
+**Вариант 2 — Python middleware** (Flask/Django/FastAPI):
+
+```python
+from sql_injection_detector import SQLInjectionEnsemble
+
+detector = SQLInjectionEnsemble()
+
+@app.before_request
+def check_sqli():
+    for value in request.form.values():
+        if detector.detect(value)["decision"] == "INJECTION":
+            abort(403)
+```
+
+---
+
+## REST API
+
+### Проверить строку
+
+```http
+POST /api/check
+Content-Type: application/json
+
+{"text": "' UNION SELECT username, password FROM users--"}
+```
+
 ```json
 {
   "decision": "INJECTION",
   "action": "BLOCK",
-  "blocked": true,
   "score": 1.0,
   "attack_type": "UNION_BASED",
   "severity": "HIGH",
-  "incident_id": 42,
   "explanation": {
-    "summary": "UNION-based data extraction SQL injection detected with HIGH confidence.",
-    "decision_factors": [
-      "Ensemble score 1.00 exceeds high-confidence threshold 0.60",
-      "Semantic score 13.0 exceeds minimum threshold 2.0",
-      "Model agreement: RF and CNN signals converge"
-    ]
+    "summary": "UNION-based SQL injection detected with HIGH confidence."
   }
 }
 ```
 
-### Проверить форму (несколько полей)
+### Проверить форму
 
 ```http
-POST http://localhost:5000/api/validate
+POST /api/validate
 Content-Type: application/json
 
-{
-  "fields": {
-    "username": "admin",
-    "password": "' OR '1'='1",
-    "email": "user@example.com"
-  }
-}
-```
-
-**Ответ:**
-```json
-{
-  "safe": false,
-  "blocked_fields": ["password"],
-  "results": {
-    "username": {"decision": "SAFE",      "action": "ALLOW", "score": 0.00},
-    "password": {"decision": "INJECTION", "action": "BLOCK", "score": 1.00},
-    "email":    {"decision": "SAFE",      "action": "ALLOW", "score": 0.02}
-  }
-}
+{"fields": {"username": "admin", "password": "' OR '1'='1"}}
 ```
 
 ### Все эндпоинты
@@ -301,163 +192,145 @@ Content-Type: application/json
 | Метод | Путь | Описание |
 |-------|------|----------|
 | `POST` | `/api/check` | Проверить одну строку |
-| `POST` | `/api/validate` | Проверить форму |
+| `POST` | `/api/validate` | Проверить форму (несколько полей) |
 | `GET` | `/api/health` | Статус сервера и моделей |
 | `GET` | `/api/stats` | Статистика инцидентов |
-| `GET` | `/api/incidents` | Список инцидентов (с пагинацией) |
+| `GET` | `/api/incidents` | Список инцидентов |
 | `GET` | `/api/export` | SIEM-экспорт (JSON / CSV / CEF) |
-| `GET` | `/api/agent/stats` | Статистика AI-агента |
 | `GET` | `/api/agent/ip/{ip}` | Репутация IP-адреса |
 | `GET` | `/metrics` | Prometheus-метрики |
-| `GET` | `/docs` | Swagger UI (автодокументация) |
+| `GET` | `/docs` | Swagger UI |
 
 ---
 
-## 🧨 Типы обнаруживаемых атак
+## Демо-прототип (TenderPro)
 
-| Тип атаки | Пример | Серьёзность |
-|-----------|--------|-------------|
-| `BOOLEAN_BASED` | `' OR '1'='1` | MEDIUM |
-| `COMMENT_TRUNCATION` | `admin'--` | LOW |
-| `UNION_BASED` | `' UNION SELECT * FROM users--` | HIGH |
-| `TIME_BASED` | `' AND SLEEP(5)--` | MEDIUM |
-| `STACKED_QUERY` | `'; DROP TABLE users--` | **CRITICAL** |
-| `ERROR_BASED` | `' AND extractvalue(1,concat(...))--` | HIGH |
-| `OS_COMMAND` | `'; EXEC xp_cmdshell('dir')--` | **CRITICAL** |
-| `OUT_OF_BAND` | DNS-эксфильтрация данных | **CRITICAL** |
-| `NONE` | Безопасный ввод | INFO |
+`demo_site.py` — симуляция корпоративного портала закупок с защитой.
 
-**Дополнительно:** обнаруживает обфусцированные атаки через URL-кодирование (`%27%20OR`), многострочные комментарии (`'/**/OR/**/1=1--`), Unicode-подмену символов и другие техники обхода.
+**Запуск (2 терминала):**
+
+```bash
+# Терминал 1
+.venv\Scripts\python -m uvicorn api_server:app --host 0.0.0.0 --port 5000
+
+# Терминал 2
+.venv\Scripts\python demo_site.py
+```
+
+**Что показывает:**
+- Клиент вводит SQL-инъекцию в форму логина → видит generic-ошибку с кодом `INC-XXXXXXX`
+- Панель SOC (`/admin`) мгновенно показывает инцидент: IP, payload, тип атаки, score
+- Инциденты сохраняются в `demo_incidents.db` — не теряются при перезапуске
+- Кнопка "Очистить" в панели SOC удаляет все инциденты из памяти и БД
+
+**Атаки для демонстрации:**
+```
+' OR '1'='1'--
+' UNION SELECT * FROM users--
+admin'--
+'; DROP TABLE users--
+```
 
 ---
 
-## 🧪 Запуск тестов
+## Тесты
 
 ```bash
 # Все тесты
 pytest tests/ -v
 
-# С отчётом о покрытии
-pytest tests/ --cov=. --cov-report=html
-
-# Только юнит-тесты детектора
+# Только детектор
 pytest tests/test_detector.py -v
 
-# Тесты API (нужен запущенный сервер)
-pytest tests/test_api.py -v
+# Аудит обходов защиты
+pytest tests/test_bypass_audit.py -v
 
-# Фазз-тестирование (генерирует случайные атаки)
-pytest tests/test_adversarial_fuzz.py -v
-```
+# Нагрузочный тест
+python load_test.py
 
-### Нагрузочное и стресс-тестирование
-
-```bash
-# Замер скорости (p50/p95/p99 латентность)
-python benchmark.py
-
-# Нагрузочный тест (4 процесса, 1000 запросов)
-python load_test.py --workers 4 --requests 1000
-
-# Длительный тест на стабильность (5 минут)
-python soak_test.py --duration 300
+# Стресс-тест (72 сценария)
+python tests/stress_test.py
 ```
 
 ---
 
-## ⚙️ Конфигурация
+## Конфигурация
 
-Скопируйте `.env.example` в `.env` и настройте нужные параметры:
+Скопируйте `.env.example` в `.env`:
 
 ```bash
 cp .env.example .env
 ```
 
-Основные переменные:
-
 | Переменная | По умолчанию | Описание |
 |-----------|-------------|----------|
-| `API_HOST` | `0.0.0.0` | Адрес сервера |
 | `API_PORT` | `5000` | Порт сервера |
 | `API_KEY` | — | Ключ авторизации (опционально) |
 | `ENSEMBLE_W_CNN` | `0.65` | Вес CNN в ансамбле |
-| `ENSEMBLE_W_RF` | `0.35` | Вес Random Forest в ансамбле |
-| `ENSEMBLE_TAU_HIGH` | `0.60` | Порог уверенности для блокировки |
-| `LOG_LEVEL` | `INFO` | Уровень логирования (`DEBUG`/`INFO`/`WARNING`) |
-| `SQLI_BACKEND` | `sqlite` | Хранилище состояния (`sqlite` / `redis`) |
-| `REDIS_URL` | — | URL Redis (для распределённого режима) |
+| `ENSEMBLE_W_RF` | `0.35` | Вес Random Forest |
+| `ENSEMBLE_TAU_HIGH` | `0.60` | Порог блокировки |
+| `SQLI_BACKEND` | `sqlite` | Хранилище: `sqlite` или `redis` |
+| `REDIS_URL` | — | URL Redis (для кластера) |
 
 ---
 
-## 🐳 Docker
+## Docker
 
 ```bash
 # Запустить всё (API + Redis + Prometheus + Grafana)
 docker-compose up -d
 
-# Только API-сервер
+# Только API
 docker build -t sqli-detector .
 docker run -p 5000:5000 sqli-detector
 ```
 
 ---
 
-## 🤖 AI-агент
-
-Помимо детектора, проект содержит интеллектуальный агент (`agent.py`), который работает поверх детектора:
-
-- **Память IP** — каждый IP получает оценку репутации от 0.0 (чистый) до 1.0 (атакующий)
-- **Память сессий** — отслеживает паттерны атак внутри одной сессии
-- **Эскалация** — 3+ подозрительных запроса за 2 минуты → автоматическая блокировка
-- **Адаптация** — при высокой репутации атакующего порог обнаружения снижается (×0.75)
-- **Онлайн-обучение** — SGDClassifier адаптируется к новым атакам без переобучения
-
----
-
-## 🏋️ Обучение моделей с нуля
-
-Если хотите обучить модели самостоятельно:
+## Обучение моделей
 
 ```bash
 # Random Forest (~2 мин, CPU)
 python training/train_rf.py
 
-# VDCNN (рекомендуется GPU, работает и на CPU)
+# VDCNN (рекомендуется GPU)
 python training/train_cnn.py --epochs 35
 
-# BiLSTM (альтернативная архитектура)
-python training/train_bilstm.py
-
-# Посмотреть процесс обучения в Jupyter
+# Jupyter-ноутбук
 jupyter notebook VDCNN_Model.ipynb
 ```
 
-Датасет: `data/dataset.csv` и `SQL_Dataset_Extended.csv`.
+Датасет: `data/dataset.csv`, `SQL_Dataset_Extended.csv`
 
 ---
 
-## 📚 Дополнительные материалы
+## Структура проекта
 
-| Документ | Описание |
-|----------|----------|
-| [DOCUMENTATION.md](DOCUMENTATION.md) | Полная техническая документация |
-| [ARCHITECTURE_10_10.md](ARCHITECTURE_10_10.md) | Детальное описание архитектуры |
-| [SECURITY_WHITEPAPER.md](SECURITY_WHITEPAPER.md) | Security Whitepaper (чеклист из 24 пунктов) |
-| [CHANGELOG.md](CHANGELOG.md) | История всех версий (v3.0 → v3.9) |
-| [VDCNN_Model.ipynb](VDCNN_Model.ipynb) | Jupyter: обучение нейросети шаг за шагом |
+```
+├── sql_injection_detector.py   # Детектор — 7-слойный пайплайн
+├── api_server.py               # REST API (FastAPI)
+├── demo_site.py                # Демо-сайт TenderPro
+├── agent.py                    # AI-агент: IP-репутация, эскалация
+├── config.py                   # Конфигурация
+├── incident_logger.py          # Логирование инцидентов
+├── state_backend.py            # Хранилище (SQLite / Redis)
+├── logger.py                   # Структурированные логи
+├── metrics.py                  # Prometheus-метрики
+├── models/                     # ML-модели (веса + архитектуры)
+├── training/                   # Скрипты обучения
+├── tests/                      # Тесты (495 passed)
+├── data/                       # Датасеты
+├── demo_incidents.db           # БД инцидентов демо
+├── agent_state.db              # Состояние агента
+├── rf_sql_model.pkl            # Веса Random Forest
+├── tfidf_vectorizer.pkl        # TF-IDF векторизатор
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
 
 ---
 
-## 🤝 Как внести вклад
+## Лицензия
 
-1. Сделайте fork репозитория
-2. Создайте ветку: `git checkout -b feature/my-feature`
-3. Внесите изменения и добавьте тесты
-4. Запустите тесты: `pytest tests/`
-5. Отправьте Pull Request
-
----
-
-## 📄 Лицензия
-
-MIT License — см. файл [LICENSE](LICENSE).
+MIT License — см. [LICENSE](LICENSE).
