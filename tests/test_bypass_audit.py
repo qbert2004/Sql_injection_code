@@ -35,17 +35,17 @@ def _ip(n: int) -> str:
 
 
 def _is_blocked(det, payload: str) -> bool:
-    """Returns True if detector classifies as BLOCK or SUSPICIOUS."""
-    result = det.predict(payload)
-    return result["decision"] in ("BLOCK", "SUSPICIOUS")
+    """Returns True if detector classifies as INJECTION or SUSPICIOUS."""
+    result = det.detect(payload)
+    return result["decision"] in ("INJECTION", "SUSPICIOUS")
 
 
 def _score(det, payload: str) -> float:
-    return det.predict(payload)["score"]
+    return det.detect(payload)["score"]
 
 
 def _decision(det, payload: str) -> str:
-    return det.predict(payload)["decision"]
+    return det.detect(payload)["decision"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -596,7 +596,7 @@ class TestScoreBoundaryProbing:
         """Чистое число — ALLOW"""
         payload = "42"
         result = _decision(det, payload)
-        assert result == "ALLOW", f"FALSE POSITIVE: {payload!r} -> {result}"
+        assert result == "SAFE", f"FALSE POSITIVE: {payload!r} -> {result}"
 
     def test_score_monotone_obfuscation(self, det):
         """Обфускация не должна снижать score ниже 0.4 для известных атак"""
