@@ -331,6 +331,17 @@ jupyter notebook VDCNN_Model.ipynb
 
 ---
 
+## Документация
+
+| Документ | Содержание |
+|----------|-----------|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Детальное описание 7 слоёв, ML-моделей, движка решений |
+| [docs/EVALUATION.md](docs/EVALUATION.md) | Метрики обеих моделей, обоснование весов ансамбля, ablation study |
+| [CHANGELOG.md](CHANGELOG.md) | История версий v1.0 — v3.9 |
+| [VDCNN_Model.ipynb](VDCNN_Model.ipynb) | Jupyter ноутбук с анализом архитектуры VDCNN-9 |
+
+---
+
 ## Лицензия
 
 MIT License — см. [LICENSE](LICENSE).

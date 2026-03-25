@@ -87,3 +87,14 @@ addopts = "-v --tb=short"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
+
+# ═══ Coverage ═══
+[tool.coverage.run]
+source = ["sql_injection_detector", "agent", "api_server", "config",
+          "incident_logger", "state_backend", "metrics"]
+omit   = ["tests/*", "training/*", "benchmark.py", "load_test.py",
+          "soak_test.py", "stress_test.py", "demo_site.py"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under   = 70
