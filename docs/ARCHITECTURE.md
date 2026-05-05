@@ -1,201 +1,183 @@
-# Архитектура системы обнаружения SQL-инъекций
+# Архитектура SQL Injection Detection System
 
-## Обзор
-
-Каждый входной текст проходит **7 последовательных слоёв** обработки.
-Слои спроектированы с принципом defense-in-depth: каждый слой независимо проверяет
-и уточняет решение предыдущего.
-
-```
-Входной текст
-     │
-     ▼──────────────────────────────────────────────────
-     │  Слой 0 — Нормализация
-     │  URL-decode → unicode NFKC → null-bytes strip → comment expand
-     ▼──────────────────────────────────────────────────
-     │  Слой 1 — Лексический фильтр (быстрый путь)
-     │  Если SQL-паттерн НЕ найден → SAFE (выход без ML)
-     ▼──────────────────────────────────────────────────
-     │  Слой 2 — ML Ансамбль
-     │  Random Forest (35%) + VDCNN-9 CNN (65%) → score S ∈ [0,1]
-     ▼──────────────────────────────────────────────────
-     │  Слой 3 — Семантическая валидация (sqlglot AST)
-     │  Инвариант: ML один НЕ МОЖЕТ → INJECTION без semantic_score ≥ τ
-     ▼──────────────────────────────────────────────────
-     │  Слой 4 — Движок решений (8 правил приоритета)
-     ▼──────────────────────────────────────────────────
-     │  Слой 5 — Серьёзность и действие: ALLOW / LOG / BLOCK / ALERT
-     ▼──────────────────────────────────────────────────
-     │  Слой 6 — Объяснение (trace, MITRE ATT&CK, SIEM CEF-поля)
-     ▼
-  Результат
-```
+> Дипломный проект: многоуровневая система обнаружения SQL-инъекций
+> Метод интерпретации: **Character-level Occlusion Heatmap**
 
 ---
 
-## Слой 0 — Нормализация
+## 1. Общая схема
 
-**Цель:** привести входной текст к каноническому виду, устранить обфускацию.
-
-Операции (применяются последовательно):
-1. URL-декодирование (`%27` → `'`, `%20` → ` `)
-2. Unicode NFKC нормализация (полноширинные символы → ASCII)
-3. Удаление null-байтов (`\x00`)
-4. Раскрытие SQL-комментариев:
-   - `/*comment*/` → пробел
-   - `--остаток строки` → пустая строка
-   - `/*!50000 version-specific */` → раскрывается
-
-**Пример:**
 ```
-Вход:  %27%20OR%20%271%27%3D%271
-После: ' OR '1'='1
+                ┌──────────────────────────────────────────────┐
+                │           Внешний клиент / приложение         │
+                └────────────────────┬─────────────────────────┘
+                                     │ HTTP POST /api/check
+                                     ▼
+                ┌──────────────────────────────────────────────┐
+                │              FastAPI (api_server.py)         │
+                │   Rate-limit · Auth · CORS · Prometheus      │
+                └────────────────────┬─────────────────────────┘
+                                     │
+                                     ▼
+                ┌──────────────────────────────────────────────┐
+                │      SQLInjectionEnsemble (детектор)         │
+                │  ┌────────────────────────────────────────┐  │
+                │  │  Слой 0: Нормализация                  │  │
+                │  │  Слой 1: Лексический фильтр            │  │
+                │  │  Слой 2: ML-ансамбль (RF + CNN)        │  │
+                │  │  Слой 3: Семантическая валидация       │  │
+                │  │  Слой 4: Движок решений                │  │
+                │  │  Слой 5: Severity / Action             │  │
+                │  │  Слой 6: Объяснение и SIEM-поля        │  │
+                │  └────────────────────────────────────────┘  │
+                └──────┬──────────────┬──────────────┬─────────┘
+                       │              │              │
+                       ▼              ▼              ▼
+              IncidentLogger   StateBackend    PrometheusMetrics
+              (SQLite/CEF)     (SQLite/Redis)  (/metrics endpoint)
 ```
 
 ---
 
-## Слой 1 — Лексический фильтр
+## 2. Компоненты
 
-**Цель:** быстрый выход для 100% безопасных входных данных (без ML).
+### 2.1 `sql_injection_detector.py` — ядро
 
-Проверяет наличие SQL-лексем: `SELECT`, `UNION`, `INSERT`, `UPDATE`, `DELETE`, `DROP`,
-`EXEC`, `CAST`, `CONVERT`, `SLEEP`, `BENCHMARK`, `--`, `/*`, `'`, `;`.
+7-слойный пайплайн `SQLInjectionEnsemble.detect(text)`:
 
-Если ни одна лексема не найдена → результат `SAFE` немедленно, без обращения к ML.
-Это снижает нагрузку на ~40% запросов (обычные поля форм без SQL).
+| Слой | Что делает | Технология |
+|-----|-----------|-----------|
+| **0** | URL-decode, NFKC, удаление null-byte, нормализация комментариев | `urllib.parse`, `unicodedata` |
+| **1** | Быстрая проверка: есть ли вообще SQL-токены | regex |
+| **2** | ML-классификация ансамблем | RF + VDCNN-9 |
+| **3** | Семантический парсинг payload | `sqlglot` |
+| **4** | Принятие решения по 8 правилам приоритета | `DecisionEngine` |
+| **5** | Расчёт severity (LOW/MEDIUM/HIGH/CRITICAL) и action (ALLOW/LOG/BLOCK) | rule-based |
+| **6** | Формирование trace, MITRE ATT&CK ID, SIEM-полей | словари |
 
----
-
-## Слой 2 — ML Ансамбль
-
-### 2.1 Random Forest
-
-| Параметр | Значение |
-|----------|---------|
-| Алгоритм | RandomForestClassifier (sklearn) |
-| Деревья | 200 |
-| Глубина | 30 |
-| Веса классов | balanced |
-| Признаки | TF-IDF char_wb 2-5gram (50 000) + 5 рукописных |
-| Рукописные признаки | length, num_digits, num_special, num_quotes, num_keywords |
-| Итого признаков | 50 005 |
-
-### 2.2 VDCNN-9 (Very Deep CNN)
-
-Архитектура по статье **Conneau et al. (2017) "Very Deep Convolutional Networks for Text Classification"**.
-
-| Параметр | Значение |
-|----------|---------|
-| Входной алфавит | 70 символов (ASCII печатаемые) |
-| Max length | 200 символов |
-| Embedding dim | 16 |
-| Глубина | 9 свёрточных блоков |
-| k-max pooling | k=8 |
-| FC dim | 1024 |
-| Параметры | 7 003 089 |
-| Optimizer | AdamW (lr=0.001, weight_decay=1e-4) |
-| Criterion | BCEWithLogitsLoss + label smoothing 0.05 |
-| Обучение | 35 эпох, mixed precision (GPU/CPU) |
-
-### 2.3 Ансамблирование
-
+**Ансамблирование:**
 ```
-P_ensemble = 0.65 × P_cnn + 0.35 × P_rf
+score = 0.35 × RF.predict_proba(x) + 0.65 × CNN.softmax(x)
 ```
 
-Веса выбраны эмпирически: CNN имеет лучший recall (меньше пропущенных атак),
-RF обеспечивает высокую precision (почти 0 ложных тревог).
-Вес 0.65 для CNN смещает ансамбль в сторону recall при сохранении precision ансамбля выше RF.
+Веса (`ENSEMBLE_W_RF`, `ENSEMBLE_W_CNN`) и пороги (`ENSEMBLE_TAU_HIGH/LOW/SAFE`) настраиваются через env vars.
+
+### 2.2 ML-модели
+
+| Модель | Файл | Признаки | Размер | Точность |
+|-------|-----|---------|--------|----------|
+| **Random Forest** | `rf_sql_model.pkl` | TF-IDF (char 2–5gram, 50 000 ngrams) + 5 ручных | ~50 005 | 99.18% |
+| **VDCNN-9 (CNN)** | `models/char_cnn_detector.pt` | Char-embedding (PyTorch) | 9 conv-блоков | 99.90% |
+| **Ансамбль** | оба | взвешенное среднее + правила | — | **99.30%** |
+
+Метаданные RF — в `model_metadata.json` (версия, sklearn-версия, hash датасета, команда воспроизведения).
+
+### 2.3 `api_server.py` — REST-фасад
+
+- **FastAPI** с `lifespan`-управлением загрузкой моделей
+- Эндпоинты: `/api/check`, `/api/validate`, `/api/health`, `/api/stats`, `/api/incidents`, `/api/export`, `/metrics`
+- Аутентификация через `API_KEY` (опционально)
+- CORS для локальной разработки
+- Rate-limit (`RATE_LIMIT` req/min)
+
+### 2.4 `state_backend.py` — хранилище
+
+Абстракция над двумя реализациями (выбор через `SQLI_BACKEND`):
+
+| Backend | Use case | Persistence |
+|---------|----------|-------------|
+| **SQLite** | single-node, dev, демо | файл `incidents.db` |
+| **Redis** | кластер, multi-instance API | TTL `REDIS_TTL_DAYS` (по умолчанию 7) |
+
+### 2.5 `incident_logger.py`
+
+Сохранение инцидентов в SQLite + экспорт в SIEM-форматы:
+- **JSON** (структурированный)
+- **CSV** (для Excel)
+- **CEF** (ArcSight, Splunk)
+
+### 2.6 `agent.py` — IP-репутация
+
+AI-агент, который:
+- Ведёт счётчик нарушений по IP
+- Эскалирует severity при повторных атаках с одного IP
+- Хранит состояние в `agent_state.db`
+
+### 2.7 `demo_site.py` — TenderPro
+
+Симуляция корпоративного портала закупок:
+- Форма логина, проверяемая через `/api/check`
+- Панель SOC `/admin` с live-инцидентами
+- Используется как наглядная демонстрация для защиты диплома
 
 ---
 
-## Слой 3 — Семантическая валидация
-
-**Инструмент:** `sqlglot` — SQL-парсер с поддержкой 20+ диалектов.
-
-**Ключевой инвариант системы:**
-> ML classifier score ≥ threshold → CANDIDATE
-> Но: `INJECTION` выставляется только если ТАКЖЕ `semantic_score ≥ τ_semantic_min`
-
-Это исключает ложные срабатывания ML на безвредных строках, похожих на SQL.
-
-Семантический анализ определяет:
-- Тип атаки: BOOLEAN_BASED, UNION_BASED, STACKED_QUERY, TIME_BASED и др.
-- Наличие опасных конструкций: `DROP TABLE`, `EXEC xp_cmdshell`, `SLEEP()`, `UNION SELECT`
-
----
-
-## Слой 4 — Движок решений
-
-8 правил с жёстким приоритетом (порядок важен):
-
-| Приоритет | Правило | Действие |
-|-----------|---------|---------|
-| 1 | Явная семантика STACKED_QUERY / OS_COMMAND | INJECTION (CRITICAL) |
-| 2 | `P_ensemble ≥ 0.95` И semantic подтверждение | INJECTION |
-| 3 | `P_ensemble ≥ 0.85` | SUSPICIOUS |
-| 4 | semantic_score ≥ τ без ML | INJECTION (semantic-only) |
-| 5 | `P_ensemble ≥ 0.65` | SUSPICIOUS (LOW) |
-| 6 | Известный безопасный паттерн (whitelist) | SAFE |
-| 7 | `P_ensemble < τ_safe` | SAFE |
-| 8 | Default | LOG (неопределённый) |
-
----
-
-## Слой 5 — Серьёзность и действие
-
-| Класс | Severity | Действие | Примеры |
-|-------|----------|---------|---------|
-| STACKED_QUERY, OS_COMMAND | CRITICAL | BLOCK + ALERT | `'; DROP TABLE--`, `xp_cmdshell` |
-| UNION_BASED, ERROR_BASED | HIGH | BLOCK | `UNION SELECT`, `extractvalue()` |
-| BOOLEAN_BASED, TIME_BASED | MEDIUM | LOG + BLOCK | `' OR 1=1`, `SLEEP(5)` |
-| COMMENT_TRUNCATION | LOW | LOG | `admin'--` |
-| OUT_OF_BAND | CRITICAL | BLOCK + ALERT | DNS-exfil |
-
----
-
-## Слой 6 — Объяснение
-
-Каждый результат содержит:
-- `decision_trace` — пошаговое логирование решения
-- `mitre_technique` — маппинг на MITRE ATT&CK (T1190 — Exploit Public-Facing Application)
-- SIEM CEF-поля: `src_ip`, `event_id`, `severity`, `signature`
-- Для BLOCK: `block_reason` и `recommendation`
-
----
-
-## AI-Агент (agent.py)
-
-Автономный агент поверх детектора:
-
-- **IP-память** — RLock-защищённый словарь истории по IP
-- **Онлайн обучение** — SGDClassifier partial_fit() на потоке событий
-- **Эскалация** — автоматическое повышение severity при паттернах атаки
-- **State backend** — SQLite (dev) или Redis (prod) для персистентности между перезапусками
-
----
-
-## Структура файлов
+## 3. Поток данных (happy path)
 
 ```
-sql_injection_detector.py  — 7-слойный пайплайн (~2000 строк)
-config.py                  — параметры (env vars, dataclass frozen=True)
-agent.py                   — AI-агент
-api_server.py              — FastAPI + Prometheus
-demo_site.py               — TenderPro демо
-incident_logger.py         — SQLite инциденты
-state_backend.py           — SQLite / Redis backend
-models/
-├── char_cnn_detector.pt   — VDCNN-9 веса (PyTorch, 27 MB)
-├── char_cnn_model.py      — архитектура модели
-├── char_tokenizer.py/json — символьный токенизатор
-├── bilstm_sql_detector.pt — BiLSTM (альтернатива)
-└── char_bilstm_model.py
-rf_sql_model.pkl           — Random Forest
-tfidf_vectorizer.pkl       — TF-IDF векторизатор
-training/
-├── train_cnn.py           — обучение VDCNN-9
-├── train_rf.py            — обучение RF
-├── generate_dataset.py    — генерация/аугментация датасета
-└── *_training_log.json    — логи обучения
+1. POST /api/check {"text": "' OR '1'='1"}
+2. APIServer → SQLInjectionEnsemble.detect()
+3. Слой 0:  "' OR '1'='1"  (без изменений — нет URL-encoding)
+4. Слой 1:  обнаружены SQL-токены ('OR', "'") → продолжаем
+5. Слой 2:  RF=0.94, CNN=0.97 → ensemble=0.36*0.94+0.65*0.97 = 0.96
+6. Слой 3:  sqlglot парсит как WHERE-clause с tautology → semantic_score=8
+7. Слой 4:  правило #2 (ml_high + semantic_strong) → INJECTION
+8. Слой 5:  attack_type=BOOLEAN_BASED → severity=MEDIUM, action=BLOCK
+9. Слой 6:  trace, MITRE T1190, IoC → JSON-ответ
+10. IncidentLogger пишет в incidents.db
+11. PrometheusMetrics инкрементирует counters
+12. Response: {"decision":"INJECTION","action":"BLOCK", ...}
 ```
+
+Latency end-to-end: **~60 мс** (см. [EVALUATION.md](EVALUATION.md)).
+
+---
+
+## 4. Метод интерпретации — Occlusion Heatmap
+
+В отличие от APT (SHAP) и IR-Agent (LIME), здесь применён **посимвольный окклюзионный анализ**, потому что вход — это последовательность символов, а не табличные признаки.
+
+**Алгоритм** (`char_heatmap.py`):
+
+1. Получить базовый score детектора для запроса `q`: `s_0 = detect(q).score`
+2. Для каждой позиции `i` в `q`:
+   - Сформировать `q_i = q[:i] + " " + q[i+1:]` (маскируем символ пробелом)
+   - Получить `s_i = detect(q_i).score`
+   - Атрибуция: `Δ_i = s_0 − s_i`
+3. Положительный `Δ` → символ **повышает** опасность (атакующий компонент)
+4. Отрицательный `Δ` → символ **маскирует** опасность
+
+**Артефакты:**
+- `models/heatmap_01..10.png` — тепловая карта по 10 заранее заданным запросам
+- `heatmap_report.html` — интерактивный HTML с подсветкой каждого символа
+
+Преимущество перед SHAP/LIME: работает с raw-последовательностью, показывает **где именно** в payload находится атакующий код.
+
+---
+
+## 5. Прод-готовность
+
+| Категория | Реализация |
+|-----------|------------|
+| **Configuration** | `config.py` (frozen dataclasses), `.env`-загрузка через `python-dotenv` |
+| **Logging** | Structured JSON через `logger.py` |
+| **Metrics** | Prometheus в `metrics.py`, `/metrics`-endpoint |
+| **Rate limit** | Per-IP, configurable через `RATE_LIMIT` |
+| **Auth** | API-key через заголовок `X-API-Key` |
+| **Persistence** | SQLite (default) или Redis (cluster) |
+| **Container** | Multi-stage `Dockerfile`, `docker-compose.yml` (API + Redis + Prometheus + Grafana) |
+| **CI/CD** | GitHub Actions: lint (ruff) + test matrix (py3.11/3.12/3.13) + Docker build |
+| **Тесты** | pytest, 495 passed (детектор, API, обходы, fuzz, состояние) |
+
+---
+
+## 6. Используемые технологии
+
+- **Python** 3.11+
+- **PyTorch** 2.0+ (CNN)
+- **scikit-learn** 1.8 (RF + TF-IDF)
+- **sqlglot** (семантический парсер)
+- **FastAPI** 0.121, **Uvicorn**
+- **SQLite** / **Redis** (storage)
+- **Prometheus** + **Grafana** (мониторинг)
+- **Docker**, **docker-compose**
